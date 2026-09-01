@@ -2,9 +2,10 @@
 # ==============================================================================
 # Script Name: san-compare.sh
 # Description: Compares two X.509 leaf certificates parameter-by-parameter and
-#              highlights differences with special emphasis on SAN (Subject Alternative Names).
+#              highlights differences with rich contextual verdict variations
+#              (Renewal, Expansion, Breaking Contraction, Crypto upgrades, CA shifts).
 # Author: Daily Tools (https://github.com/khishoer/Daily-tools)
-# Requirements: bash, openssl, awk, sed, grep
+# Requirements: bash, openssl, awk, sed, grep, python3
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -23,6 +24,9 @@ setup_colors() {
         WHITE="\033[37m"
         BG_RED="\033[41;37m"
         BG_GREEN="\033[42;30m"
+        BG_YELLOW="\033[43;30m"
+        BG_BLUE="\033[44;37m"
+        BG_MAGENTA="\033[45;37m"
         RESET="\033[0m"
     else
         BOLD=""
@@ -36,6 +40,9 @@ setup_colors() {
         WHITE=""
         BG_RED=""
         BG_GREEN=""
+        BG_YELLOW=""
+        BG_BLUE=""
+        BG_MAGENTA=""
         RESET=""
     fi
 }
@@ -52,6 +59,13 @@ ${BOLD}Description:${RESET}
   Deeply compares two X.509 leaf certificates across all standard parameters
   (Subject, Issuer, Validity, Public Key, Key Usage, Fingerprints) and performs
   a detailed Subject Alternative Name (SAN) delta analysis (Added / Removed / Common).
+  Outputs an intelligent, rich verdict categorized by lifecycle scenario:
+  - 🔄 Seamless Renewal / Re-issuance
+  - 📈 Backwards-Compatible SAN Expansion
+  - 🚨 Dangerous SAN Contraction (Breaking Changes)
+  - 🔀 Mixed SAN Overhaul & Domain Drift
+  - ❌ Completely Disjoint / Unrelated Certificates
+  - 🔐 Cryptographic & CA Migration Audits
 
 ${BOLD}Arguments:${RESET}
   <CERT1>, <CERT2>     Can be:
@@ -170,10 +184,15 @@ extract_params() {
     fi
 
     # Public Key Info (Algorithm & Size)
-    local pubkey_algo pubkey_bits
+    local pubkey_algo pubkey_bits pubkey_mod
     pubkey_algo=$(safe_x509_cmd "$pem" -noout -text | grep -A 1 "Public Key Algorithm:" | head -n 1 | awk -F: '{print $2}' | sed 's/^[ \t]*//' || true)
     pubkey_bits=$(safe_x509_cmd "$pem" -noout -text | grep -E "(Public-Key|RSA Public-Key|NIST CURVE|ASN1 OID):" | head -n 1 | sed -E 's/.*: (.*)/\1/' | sed 's/^[ \t]*//' || true)
+    eval "${prefix}_pubkey_algo=\"\$pubkey_algo\""
+    eval "${prefix}_pubkey_bits=\"\$pubkey_bits\""
     eval "${prefix}_pubkey_info=\"\${pubkey_algo:-Unknown} (\${pubkey_bits:-N/A})\""
+
+    # Public Key Hash (to check if private/public key was rotated)
+    eval "${prefix}_pubkey_modulus=\"\$(openssl x509 -in \"\$pem\" -noout -pubkey 2>/dev/null | openssl sha256 | awk '{print \$NF}' || true)\""
 
     # Fingerprints
     eval "${prefix}_sha256=\"\$(safe_x509_cmd \"\$pem\" -noout -fingerprint -sha256 | sed -e 's/^SHA256 Fingerprint=//' -e 's/^sha256 Fingerprint=//')\""
@@ -313,6 +332,37 @@ ADDED_COUNT=$(wc -l < "$ADDED_SANS" | tr -d ' ')
 
 SAN_DIFF_COUNT=$((REMOVED_COUNT + ADDED_COUNT))
 
+# ------------------------------------------------------------------------------
+# Date / Lifetime Analytics via Python Helper
+# ------------------------------------------------------------------------------
+DATE_EVAL=$(python3 -c "
+from datetime import datetime, timezone
+
+def parse_date(d_str):
+    try:
+        cleaned = ' '.join(d_str.split())
+        return datetime.strptime(cleaned, '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+d1 = parse_date('''$c1_not_after''')
+d2 = parse_date('''$c2_not_after''')
+now = datetime.now(timezone.utc)
+
+rem1 = (d1 - now).days if d1 else 0
+rem2 = (d2 - now).days if d2 else 0
+
+delta_days = (d2 - d1).days if (d1 and d2) else 0
+
+newer = 'true' if (d2 and d1 and d2 > d1) else 'false'
+older = 'true' if (d2 and d1 and d2 < d1) else 'false'
+same = 'true' if (d2 and d1 and d2 == d1) else 'false'
+
+print(f'REM1={rem1};REM2={rem2};DELTA_DAYS={delta_days};NEWER={newer};OLDER={older};SAME_DATE={same}')
+")
+
+eval "$DATE_EVAL"
+
 if [[ "$QUIET" == true ]]; then
     if [[ $SAN_DIFF_COUNT -eq 0 && "$c1_sha256" == "$c2_sha256" ]]; then
         exit 0
@@ -346,8 +396,7 @@ if [[ "$SAN_ONLY" == false ]]; then
     compare_field "Public Key" "$c1_pubkey_info" "$c2_pubkey_info"
     compare_field "Not Before (Start)" "$c1_not_before" "$c2_not_before"
     compare_field "Not After (Expiry)" "$c1_not_after" "$c2_not_after"
-    compare_field "Validity Status [1]" "$c1_status" "$c1_status"
-    compare_field "Validity Status [2]" "$c2_status" "$c2_status"
+    compare_field "Validity Status" "$c1_status ($REM1 days rem.)" "$c2_status ($REM2 days rem.)"
     compare_field "Key Usage" "$c1_key_usage" "$c2_key_usage"
     compare_field "Ext Key Usage (EKU)" "$c1_ext_key_usage" "$c2_ext_key_usage"
     compare_field "Basic Constraints" "$c1_basic_constraints" "$c2_basic_constraints"
@@ -405,23 +454,162 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Final Summary Verdict
+# Multi-Dimensional Intelligence Verdict Analysis
 # ------------------------------------------------------------------------------
 echo -e "${CYAN}================================================================================${RESET}"
-if [[ $TOTAL_DIFFS -eq 0 && $SAN_DIFF_COUNT -eq 0 ]]; then
-    echo -e "  ${BG_GREEN} VERDICT: CERTIFICATES ARE IDENTICAL ${RESET}"
-    echo -e "  ${GREEN}All $TOTAL_CHECKS inspected parameters and all SAN entries matched perfectly.${RESET}"
-elif [[ $SAN_DIFF_COUNT -eq 0 && $TOTAL_DIFFS -gt 0 ]]; then
-    echo -e "  ${YELLOW}${BOLD}⚠ VERDICT: EQUIVALENT SANS, BUT METADATA DIFFERS (${TOTAL_DIFFS} differences)${RESET}"
-    echo -e "  ${YELLOW}SANs are identical, but Serial Number, Expiry, or Key material has changed.${RESET}"
+echo -e "${BOLD}${CYAN}                 📊 COMPREHENSIVE VERDICT & RISK ANALYSIS                      ${RESET}"
+echo -e "${CYAN}================================================================================${RESET}"
+
+# Determine Scenario Category
+SCENARIO=""
+RISK_LEVEL=""
+RISK_COLOR=""
+SUMMARY_TITLE=""
+
+# 1. Exact Duplicate
+if [[ "$c1_sha256" == "$c2_sha256" ]]; then
+    SCENARIO="IDENTICAL"
+    RISK_LEVEL="NONE"
+    RISK_COLOR="$GREEN"
+    SUMMARY_TITLE="🎯 EXACT IDENTICAL CERTIFICATE (Same Fingerprint & Serial)"
+
+# 2. Complete Disjoint (No shared domains)
+elif [[ "$COMMON_COUNT" -eq 0 && "$C1_SAN_COUNT" -gt 0 && "$C2_SAN_COUNT" -gt 0 ]]; then
+    SCENARIO="DISJOINT"
+    RISK_LEVEL="HIGH (INCOMPATIBLE TARGETS)"
+    RISK_COLOR="$RED"
+    SUMMARY_TITLE="❌ COMPLETELY DISJOINT / UNRELATED CERTIFICATES"
+
+# 3. Seamless Renewal (Same SANs, valid newer dates or rotated key/serial)
+elif [[ "$SAN_DIFF_COUNT" -eq 0 ]]; then
+    if [[ "$OLDER" == "true" ]]; then
+        SCENARIO="RENEWAL_REGRESSION"
+        RISK_LEVEL="HIGH (EXPIRATION REGRESSION)"
+        RISK_COLOR="$RED"
+        SUMMARY_TITLE="⚠️ LIFETIME REGRESSION (Cert [2] expires earlier than Cert [1])"
+    elif [[ "$c1_status" == "EXPIRED" && "$c2_status" == "VALID" ]]; then
+        SCENARIO="EXPIRED_REPLACEMENT"
+        RISK_LEVEL="LOW (MANDATORY UPDATE)"
+        RISK_COLOR="$GREEN"
+        SUMMARY_TITLE="🔄 EXPIRED CERTIFICATE REPLACEMENT (Cert [1] is Expired)"
+    else
+        SCENARIO="RENEWAL_SEAMLESS"
+        RISK_LEVEL="LOW (SAFE TO DEPLOY)"
+        RISK_COLOR="$GREEN"
+        SUMMARY_TITLE="🔄 SEAMLESS CERTIFICATE RENEWAL / RE-ISSUANCE"
+    fi
+
+# 4. Safe SAN Expansion (0 removed, N added)
+elif [[ "$REMOVED_COUNT" -eq 0 && "$ADDED_COUNT" -gt 0 ]]; then
+    SCENARIO="SAN_EXPANSION"
+    RISK_LEVEL="LOW-MEDIUM (BACKWARDS COMPATIBLE)"
+    RISK_COLOR="$GREEN"
+    SUMMARY_TITLE="📈 SAN EXPANSION (All original domains preserved + $ADDED_COUNT new)"
+
+# 5. Breaking SAN Contraction (N removed, 0 added)
+elif [[ "$REMOVED_COUNT" -gt 0 && "$ADDED_COUNT" -eq 0 ]]; then
+    SCENARIO="SAN_CONTRACTION"
+    RISK_LEVEL="CRITICAL (BREAKING CHANGE - DOMAINS LOST)"
+    RISK_COLOR="$RED"
+    SUMMARY_TITLE="🚨 SAN CONTRACTION / REMOVAL ($REMOVED_COUNT domains removed)"
+
+# 6. Mixed SAN Overhaul
 else
-    echo -e "  ${BG_RED} VERDICT: DIFFERENCES DETECTED ${RESET}"
-    echo -e "  ${RED}Found ${TOTAL_DIFFS} parameter differences and ${SAN_DIFF_COUNT} SAN changes.${RESET}"
+    SCENARIO="SAN_OVERHAUL"
+    RISK_LEVEL="HIGH (COMPLEX DRIFT)"
+    RISK_COLOR="$YELLOW"
+    SUMMARY_TITLE="🔀 SAN OVERHAUL / PARTIAL DRIFT (+$ADDED_COUNT added, -$REMOVED_COUNT removed)"
 fi
+
+# Print Primary Verdict Header
+echo -e "  ${BOLD}Verdict Category:${RESET}  ${BOLD}${SUMMARY_TITLE}${RESET}"
+echo -e "  ${BOLD}Deployment Risk:${RESET}   ${RISK_COLOR}${BOLD}[ ${RISK_LEVEL} ]${RESET}\n"
+
+# Print Key Analytical Insights
+echo -e "  ${BOLD}${WHITE}🔍 Key Lifecycle Insights:${RESET}"
+
+# 1. SAN Insight
+if [[ "$SAN_DIFF_COUNT" -eq 0 ]]; then
+    echo -e "    • ${GREEN}SAN Continuity:${RESET}  100% match. All ${C1_SAN_COUNT} domain(s) fully preserved."
+elif [[ "$REMOVED_COUNT" -eq 0 ]]; then
+    echo -e "    • ${GREEN}SAN Continuity:${RESET}  Backwards-compatible. All ${COMMON_COUNT} existing domains preserved + ${ADDED_COUNT} added."
+elif [[ "$COMMON_COUNT" -eq 0 ]]; then
+    echo -e "    • ${RED}SAN Continuity:${RESET}  0% overlap. No shared Subject Alternative Names."
+else
+    echo -e "    • ${YELLOW}SAN Continuity:${RESET}  Partial overlap (${COMMON_COUNT} preserved, ${ADDED_COUNT} new, ${RED}${REMOVED_COUNT} dropped${RESET})."
+fi
+
+# 2. Validity / Expiry Insight
+if [[ "$SAME_DATE" == "true" ]]; then
+    echo -e "    • ${DIM}Validity Period:${RESET} Both certificates share the exact same expiry (${c2_not_after})."
+elif [[ "$NEWER" == "true" ]]; then
+    echo -e "    • ${GREEN}Validity Delta:${RESET}  Cert [2] extends coverage by ${BOLD}+${DELTA_DAYS} days${RESET} (Expires: ${c2_not_after}, ${REM2} days remaining)."
+elif [[ "$OLDER" == "true" ]]; then
+    echo -e "    • ${RED}Validity Delta:${RESET}  Cert [2] expires ${BOLD}${DELTA_DAYS#-} days SOONER${RESET} than Cert [1] (Expires: ${c2_not_after})."
+fi
+
+# 3. Cryptographic Key Insight
+if [[ "$c1_pubkey_modulus" == "$c2_pubkey_modulus" && -n "$c1_pubkey_modulus" ]]; then
+    echo -e "    • ${DIM}Private Key Pair:${RESET} Shared (Re-issued with the SAME underlying private key)."
+else
+    echo -e "    • ${CYAN}Private Key Pair:${RESET} Rotated (Issued with a fresh, distinct cryptographic key pair)."
+fi
+
+# 4. Crypto Algorithm Evolution
+if [[ "$c1_pubkey_info" != "$c2_pubkey_info" ]]; then
+    if [[ "$c1_pubkey_algo" =~ rsa && "$c2_pubkey_algo" =~ (ec|ECDSA) ]]; then
+        echo -e "    • ${GREEN}Crypto Modernization:${RESET} Upgraded from RSA ➔ ECDSA (Higher security, faster TLS handshakes)."
+    elif [[ "$c1_pubkey_algo" =~ (ec|ECDSA) && "$c2_pubkey_algo" =~ rsa ]]; then
+        echo -e "    • ${YELLOW}Crypto Migration:${RESET} Changed from ECDSA ➔ RSA (Legacy compatibility mode)."
+    else
+        echo -e "    • ${CYAN}Crypto Migration:${RESET} Key parameters changed (${c1_pubkey_info} ➔ ${c2_pubkey_info})."
+    fi
+fi
+
+# 5. CA / Issuer Evolution
+if [[ "$c1_issuer" != "$c2_issuer" ]]; then
+    echo -e "    • ${CYAN}CA Migration:${RESET}     Issued by different Certificate Authority:"
+    echo -e "                       From: ${c1_issuer_cn:-$c1_issuer}"
+    echo -e "                       To:   ${c2_issuer_cn:-$c2_issuer}"
+fi
+
+# Print Specific Risk & Action Recommendations
+echo -e "\n  ${BOLD}${WHITE}📋 Actionable Recommendation:${RESET}"
+case "$SCENARIO" in
+    "IDENTICAL")
+        echo -e "    ${GREEN}✔ No action needed.${RESET} Both files/endpoints present the exact same certificate."
+        ;;
+    "RENEWAL_SEAMLESS")
+        echo -e "    ${GREEN}✔ Safe for immediate deployment.${RESET} Rotate on Load Balancers, Ingress Gateways, and CDNs without traffic risk."
+        ;;
+    "EXPIRED_REPLACEMENT")
+        echo -e "    ${GREEN}✔ Critical renewal.${RESET} Deploy immediately to replace the expired certificate and restore valid HTTPS trust."
+        ;;
+    "RENEWAL_REGRESSION")
+        echo -e "    ${RED}✖ Review required.${RESET} Cert [2] has an earlier expiration date. Verify you are not accidentally deploying an older archive cert."
+        ;;
+    "SAN_EXPANSION")
+        echo -e "    ${GREEN}✔ Safe for existing traffic.${RESET} Verify DNS A/CNAME records point to your load balancer for newly added SANs before routing new traffic."
+        ;;
+    "SAN_CONTRACTION")
+        echo -e "    ${RED}✖ DANGER OF OUTAGE!${RESET} The following domain(s) were removed in Cert [2]:"
+        while IFS= read -r san; do
+            [[ -n "$san" ]] && echo -e "        ${RED}• $san${RESET}"
+        done < "$REMOVED_SANS"
+        echo -e "      ${RED}Do NOT deploy if production traffic is still actively hitting these removed hostnames!${RESET}"
+        ;;
+    "SAN_OVERHAUL")
+        echo -e "    ${YELLOW}⚠ Audit traffic routing.${RESET} Ensure removed domains are decommissioned and new domains have active DNS bindings."
+        ;;
+    "DISJOINT")
+        echo -e "    ${RED}✖ Incompatible certificates.${RESET} These certificates belong to completely separate services or domains."
+        ;;
+esac
+
 echo -e "${CYAN}================================================================================${RESET}\n"
 
-if [[ $TOTAL_DIFFS -gt 0 || $SAN_DIFF_COUNT -gt 0 ]]; then
-    exit 1
-else
+if [[ "$SCENARIO" == "IDENTICAL" || "$SCENARIO" == "RENEWAL_SEAMLESS" || "$SCENARIO" == "EXPIRED_REPLACEMENT" || "$SCENARIO" == "SAN_EXPANSION" ]]; then
     exit 0
+else
+    exit 1
 fi
