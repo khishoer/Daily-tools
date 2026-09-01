@@ -1,81 +1,39 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Script Name: san-compare.sh
-# Description: Compares two X.509 leaf certificates parameter-by-parameter and
-#              displays a true SIDE-BY-SIDE SAN table with rich lifecycle verdicts.
+# Description: High-ergonomics X.509 certificate comparison & side-by-side SAN diff.
 # Author: Daily Tools (https://github.com/khishoer/Daily-tools)
-# Requirements: bash, openssl, awk, sed, grep, python3
+# Requirements: bash, openssl, python3
 # ==============================================================================
-
-# ------------------------------------------------------------------------------
-# Color formatting
-# ------------------------------------------------------------------------------
-setup_colors() {
-    if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
-        BOLD="\033[1m"
-        DIM="\033[2m"
-        RED="\033[31m"
-        GREEN="\033[32m"
-        YELLOW="\033[33m"
-        BLUE="\033[34m"
-        MAGENTA="\033[35m"
-        CYAN="\033[36m"
-        WHITE="\033[37m"
-        BG_RED="\033[41;37m"
-        BG_GREEN="\033[42;30m"
-        BG_YELLOW="\033[43;30m"
-        BG_BLUE="\033[44;37m"
-        RESET="\033[0m"
-    else
-        BOLD=""
-        DIM=""
-        RED=""
-        GREEN=""
-        YELLOW=""
-        BLUE=""
-        MAGENTA=""
-        CYAN=""
-        WHITE=""
-        BG_RED=""
-        BG_GREEN=""
-        BG_YELLOW=""
-        BG_BLUE=""
-        RESET=""
-    fi
-}
 
 # ------------------------------------------------------------------------------
 # Help & Usage
 # ------------------------------------------------------------------------------
 show_help() {
     cat << EOF
-${BOLD}Usage:${RESET}
+Usage:
   san-compare.sh [OPTIONS] <CERT1> <CERT2>
 
-${BOLD}Description:${RESET}
-  Deeply compares two X.509 leaf certificates across all standard parameters
-  with a dedicated ${BOLD}SIDE-BY-SIDE SAN COMPARISON TABLE${RESET} and rich lifecycle verdicts:
-  - 🔄 Seamless Renewal / Re-issuance
-  - 📈 Backwards-Compatible SAN Expansion
-  - 🚨 Dangerous SAN Contraction (Breaking Changes)
-  - 🔀 Mixed SAN Overhaul & Domain Drift
-  - ❌ Completely Disjoint / Unrelated Certificates
+Description:
+  High-ergonomics, visually intuitive X.509 certificate and SAN comparison tool.
+  Renders clean, side-by-side tables for both General Parameters and Subject
+  Alternative Names (SANs) with intelligent risk verdicts.
 
-${BOLD}Arguments:${RESET}
+Arguments:
   <CERT1>, <CERT2>     Can be:
                        - Local file path (.pem, .crt, .cer, .der, .p7b)
                        - Remote hostname with port (e.g. "google.com:443" or "https://github.com")
 
-${BOLD}Options:${RESET}
-  -s, --san-only       Only compare Subject Alternative Names (SANs) in side-by-side view
-  -w, --width <num>    Set terminal table width (default: auto or 100)
-  -q, --quiet          Quiet mode: suppress output, exit 0 if identical, 1 if differences
+Options:
+  -s, --san-only       Only compare Subject Alternative Names (SANs)
+  -q, --quiet          Quiet mode (exit 0 if identical, 1 if differences)
   -n, --no-color       Disable color output
+  -w, --width <cols>   Set custom table width (default: auto or 108)
   -h, --help           Show this help message
 
-${BOLD}Examples:${RESET}
+Examples:
   san-compare.sh cert_v1.pem cert_v2.pem
-  san-compare.sh google.com:443 youtube.com:443
+  san-compare.sh google.com:443 github.com:443
   san-compare.sh --san-only prod.crt staging.crt
 
 EOF
@@ -96,9 +54,8 @@ trap cleanup EXIT
 load_certificate() {
     local target="$1"
     local out_pem="$2"
-    local label="$3"
 
-    # 1. Check if target is a remote URL or Host:Port
+    # Remote URL or Host:Port
     if [[ "$target" =~ ^https?:// ]] || [[ "$target" =~ :[0-9]+$ ]] || [[ ! -f "$target" && "$target" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,} ]]; then
         local host="$target"
         host="${host#https://}"
@@ -110,144 +67,40 @@ load_certificate() {
             host="${host%:*}"
         fi
 
-        echo -e "${DIM}[*] Fetching leaf certificate from remote host: ${BOLD}${host}:${port}${RESET}..." >&2
+        echo "[*] Fetching leaf certificate from remote host: ${host}:${port}..." >&2
         if ! echo | openssl s_client -servername "$host" -connect "${host}:${port}" -showcerts 2>/dev/null | \
              openssl x509 -outform PEM > "$out_pem" 2>/dev/null; then
-            echo -e "${RED}[ERROR] Failed to fetch certificate from ${host}:${port}${RESET}" >&2
+            echo "[ERROR] Failed to fetch certificate from ${host}:${port}" >&2
             exit 1
         fi
         return 0
     fi
 
-    # 2. Local file
+    # Local file
     if [[ ! -f "$target" ]]; then
-        echo -e "${RED}[ERROR] File not found: '$target'${RESET}" >&2
+        echo "[ERROR] File not found: '$target'" >&2
         exit 1
     fi
 
-    # Check if PEM
     if openssl x509 -in "$target" -inform PEM -outform PEM > "$out_pem" 2>/dev/null; then
         return 0
-    # Check if DER
     elif openssl x509 -in "$target" -inform DER -outform PEM > "$out_pem" 2>/dev/null; then
         return 0
-    # Check if PKCS#7 (.p7b)
     elif openssl pkcs7 -in "$target" -print_certs 2>/dev/null | openssl x509 -outform PEM > "$out_pem" 2>/dev/null; then
         return 0
     else
-        echo -e "${RED}[ERROR] Unsupported or corrupted certificate format: '$target'${RESET}" >&2
+        echo "[ERROR] Unsupported or corrupted certificate format: '$target'" >&2
         exit 1
     fi
 }
 
 # ------------------------------------------------------------------------------
-# Extract Parameters from PEM Certificate safely
-# ------------------------------------------------------------------------------
-safe_x509_cmd() {
-    openssl x509 -in "$1" "${@:2}" 2>/dev/null || true
-}
-
-extract_params() {
-    local pem="$1"
-    local prefix="$2" # "c1" or "c2"
-
-    # Subject & Issuer
-    eval "${prefix}_subject=\"\$(safe_x509_cmd \"\$pem\" -noout -subject -nameopt RFC2253 | sed -e 's/^subject= //' -e 's/^[ \t]*//')\""
-    eval "${prefix}_issuer=\"\$(safe_x509_cmd \"\$pem\" -noout -issuer -nameopt RFC2253 | sed -e 's/^issuer= //' -e 's/^[ \t]*//')\""
-
-    # Subject CN & Issuer CN
-    eval "${prefix}_subject_cn=\"\$(safe_x509_cmd \"\$pem\" -noout -subject | sed -n 's/.*CN[ =]*//p' | sed 's/,.*//')\""
-    eval "${prefix}_issuer_cn=\"\$(safe_x509_cmd \"\$pem\" -noout -issuer | sed -n 's/.*CN[ =]*//p' | sed 's/,.*//')\""
-
-    # Serial Number & Signature Algorithm
-    eval "${prefix}_serial=\"\$(safe_x509_cmd \"\$pem\" -noout -serial | sed 's/^serial=//')\""
-    eval "${prefix}_sig_algo=\"\$(safe_x509_cmd \"\$pem\" -noout -text | grep 'Signature Algorithm:' | head -n 1 | awk -F: '{print \$2}' | sed 's/^[ \t]*//' || true)\""
-
-    # Validity Dates
-    local nb na
-    nb=$(safe_x509_cmd "$pem" -noout -startdate | sed 's/^notBefore=//')
-    na=$(safe_x509_cmd "$pem" -noout -enddate | sed 's/^notAfter=//')
-    eval "${prefix}_not_before=\"\$nb\""
-    eval "${prefix}_not_after=\"\$na\""
-
-    # Validity Status
-    if openssl x509 -in "$pem" -checkend 0 -noout >/dev/null 2>&1; then
-        eval "${prefix}_status=\"VALID\""
-    else
-        eval "${prefix}_status=\"EXPIRED\""
-    fi
-
-    # Public Key Info (Algorithm & Size)
-    local pubkey_algo pubkey_bits
-    pubkey_algo=$(safe_x509_cmd "$pem" -noout -text | grep -A 1 "Public Key Algorithm:" | head -n 1 | awk -F: '{print $2}' | sed 's/^[ \t]*//' || true)
-    pubkey_bits=$(safe_x509_cmd "$pem" -noout -text | grep -E "(Public-Key|RSA Public-Key|NIST CURVE|ASN1 OID):" | head -n 1 | sed -E 's/.*: (.*)/\1/' | sed 's/^[ \t]*//' || true)
-    eval "${prefix}_pubkey_algo=\"\$pubkey_algo\""
-    eval "${prefix}_pubkey_bits=\"\$pubkey_bits\""
-    eval "${prefix}_pubkey_info=\"\${pubkey_algo:-Unknown} (\${pubkey_bits:-N/A})\""
-
-    # Public Key Hash (to check if private/public key was rotated)
-    eval "${prefix}_pubkey_modulus=\"\$(openssl x509 -in \"\$pem\" -noout -pubkey 2>/dev/null | openssl sha256 | awk '{print \$NF}' || true)\""
-
-    # Fingerprints
-    eval "${prefix}_sha256=\"\$(safe_x509_cmd \"\$pem\" -noout -fingerprint -sha256 | sed -e 's/^SHA256 Fingerprint=//' -e 's/^sha256 Fingerprint=//')\""
-    eval "${prefix}_sha1=\"\$(safe_x509_cmd \"\$pem\" -noout -fingerprint -sha1 | sed -e 's/^SHA1 Fingerprint=//' -e 's/^sha1 Fingerprint=//')\""
-
-    # Key Identifiers (SKI & AKI)
-    eval "${prefix}_ski=\"\$(safe_x509_cmd \"\$pem\" -noout -ext subjectKeyIdentifier | grep -v 'SubjectKeyIdentifier' | sed 's/^[ \t]*//' | tr -d '\n' || true)\""
-    eval "${prefix}_aki=\"\$(safe_x509_cmd \"\$pem\" -noout -ext authorityKeyIdentifier | grep -A 1 'keyid:' | grep 'keyid:' | sed 's/.*keyid://' | tr -d ' \n' || true)\""
-
-    # Key Usage & Extended Key Usage
-    eval "${prefix}_key_usage=\"\$(safe_x509_cmd \"\$pem\" -noout -ext keyUsage | grep -v 'Key Usage' | sed 's/^[ \t]*//' | tr -d '\n' || true)\""
-    eval "${prefix}_ext_key_usage=\"\$(safe_x509_cmd \"\$pem\" -noout -ext extendedKeyUsage | grep -v 'Extended Key Usage' | sed 's/^[ \t]*//' | tr -d '\n' || true)\""
-
-    # Basic Constraints (CA / Pathlen)
-    eval "${prefix}_basic_constraints=\"\$(safe_x509_cmd \"\$pem\" -noout -ext basicConstraints | grep -v 'Basic Constraints' | sed 's/^[ \t]*//' | tr -d '\n' || true)\""
-
-    # OCSP
-    eval "${prefix}_ocsp=\"\$(safe_x509_cmd \"\$pem\" -noout -ocsp_uri || true)\""
-
-    # SAN extraction -> file
-    local san_file="${TMP_DIR}/${prefix}_sans.txt"
-    safe_x509_cmd "$pem" -noout -ext subjectAltName | \
-        grep -v "Subject Alternative Name" | \
-        tr ',' '\n' | \
-        sed 's/^[ \t]*//;s/[ \t]*$//' | \
-        grep -v '^$' | \
-        sort -u > "$san_file" || touch "$san_file"
-}
-
-# ------------------------------------------------------------------------------
-# Comparison Runner
-# ------------------------------------------------------------------------------
-TOTAL_DIFFS=0
-TOTAL_CHECKS=0
-
-compare_field() {
-    local label="$1"
-    local val1="$2"
-    local val2="$3"
-    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-
-    # Normalize empty or null values
-    val1="${val1:-<Not Present>}"
-    val2="${val2:-<Not Present>}"
-
-    if [[ "$val1" == "$val2" ]]; then
-        printf "  ${GREEN}✔${RESET} ${BOLD}%-26s${RESET} : %s\n" "$label" "$val1"
-    else
-        TOTAL_DIFFS=$((TOTAL_DIFFS + 1))
-        printf "  ${RED}✖${RESET} ${BOLD}%-26s${RESET} :\n" "$label"
-        printf "      ${RED}[1] %s${RESET}\n" "$val1"
-        printf "      ${GREEN}[2] %s${RESET}\n" "$val2"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Main Script Execution
+# CLI Flag Parsing
 # ------------------------------------------------------------------------------
 SAN_ONLY=false
 QUIET=false
-CUSTOM_WIDTH=""
+NO_COLOR_FLAG=0
+CUSTOM_WIDTH=108
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -259,20 +112,20 @@ while [[ $# -gt 0 ]]; do
             SAN_ONLY=true
             shift
             ;;
-        -w|--width)
-            CUSTOM_WIDTH="$2"
-            shift 2
-            ;;
         -q|--quiet)
             QUIET=true
             shift
             ;;
         -n|--no-color)
-            NO_COLOR=1
+            NO_COLOR_FLAG=1
             shift
             ;;
+        -w|--width)
+            CUSTOM_WIDTH="$2"
+            shift 2
+            ;;
         -*)
-            echo -e "${RED}[ERROR] Unknown option: $1${RESET}" >&2
+            echo "[ERROR] Unknown option: $1" >&2
             show_help
             exit 1
             ;;
@@ -282,7 +135,7 @@ while [[ $# -gt 0 ]]; do
             elif [[ -z "${TARGET2:-}" ]]; then
                 TARGET2="$1"
             else
-                echo -e "${RED}[ERROR] Unexpected additional argument: $1${RESET}" >&2
+                echo "[ERROR] Unexpected argument: $1" >&2
                 exit 1
             fi
             shift
@@ -290,10 +143,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-setup_colors
-
 if [[ -z "${TARGET1:-}" || -z "${TARGET2:-}" ]]; then
-    echo -e "${RED}[ERROR] You must provide two certificate targets to compare.${RESET}\n" >&2
+    echo "[ERROR] You must provide two certificate targets to compare." >&2
+    echo "" >&2
     show_help
     exit 1
 fi
@@ -301,342 +153,391 @@ fi
 CERT1_PEM="${TMP_DIR}/cert1.pem"
 CERT2_PEM="${TMP_DIR}/cert2.pem"
 
-load_certificate "$TARGET1" "$CERT1_PEM" "1"
-load_certificate "$TARGET2" "$CERT2_PEM" "2"
-
-extract_params "$CERT1_PEM" "c1"
-extract_params "$CERT2_PEM" "c2"
+load_certificate "$TARGET1" "$CERT1_PEM"
+load_certificate "$TARGET2" "$CERT2_PEM"
 
 # ------------------------------------------------------------------------------
-# SAN Analysis
+# Execute Modern Ergonomic Comparison Engine (Python)
 # ------------------------------------------------------------------------------
-C1_SAN_FILE="${TMP_DIR}/c1_sans.txt"
-C2_SAN_FILE="${TMP_DIR}/c2_sans.txt"
-
-C1_SAN_COUNT=$(wc -l < "$C1_SAN_FILE" | tr -d ' ')
-C2_SAN_COUNT=$(wc -l < "$C2_SAN_FILE" | tr -d ' ')
-
-# Calculate Sets
-COMMON_SANS="${TMP_DIR}/common_sans.txt"
-REMOVED_SANS="${TMP_DIR}/removed_sans.txt" # in 1, not in 2
-ADDED_SANS="${TMP_DIR}/added_sans.txt"     # in 2, not in 1
-
-comm -12 "$C1_SAN_FILE" "$C2_SAN_FILE" > "$COMMON_SANS"
-comm -23 "$C1_SAN_FILE" "$C2_SAN_FILE" > "$REMOVED_SANS"
-comm -13 "$C1_SAN_FILE" "$C2_SAN_FILE" > "$ADDED_SANS"
-
-COMMON_COUNT=$(wc -l < "$COMMON_SANS" | tr -d ' ')
-REMOVED_COUNT=$(wc -l < "$REMOVED_SANS" | tr -d ' ')
-ADDED_COUNT=$(wc -l < "$ADDED_SANS" | tr -d ' ')
-
-SAN_DIFF_COUNT=$((REMOVED_COUNT + ADDED_COUNT))
-
-# ------------------------------------------------------------------------------
-# Date / Lifetime Analytics via Python Helper
-# ------------------------------------------------------------------------------
-DATE_EVAL=$(python3 -c "
+python3 - << 'EOF' "$CERT1_PEM" "$CERT2_PEM" "$TARGET1" "$TARGET2" "$SAN_ONLY" "$QUIET" "$NO_COLOR_FLAG" "$CUSTOM_WIDTH"
+import sys
+import os
+import re
+import subprocess
 from datetime import datetime, timezone
 
-def parse_date(d_str):
+cert1_pem, cert2_pem, target1, target2, san_only_str, quiet_str, no_color_str, width_str = sys.argv[1:9]
+san_only = san_only_str.lower() == 'true'
+quiet = quiet_str.lower() == 'true'
+no_color = (no_color_str == '1') or ('NO_COLOR' in os.environ)
+total_width = int(width_str) if width_str.isdigit() else 108
+
+# Color definitions
+class C:
+    if not no_color and sys.stdout.isatty():
+        RESET = "\033[0m"
+        BOLD = "\033[1m"
+        DIM = "\033[2m"
+        ITALIC = "\033[3m"
+        
+        # Modern refined 256/16 colors
+        RED = "\033[38;5;203m"
+        GREEN = "\033[38;5;120m"
+        YELLOW = "\033[38;5;221m"
+        BLUE = "\033[38;5;75m"
+        MAGENTA = "\033[38;5;176m"
+        CYAN = "\033[38;5;80m"
+        WHITE = "\033[38;5;255m"
+        GRAY = "\033[38;5;244m"
+        DARK_GRAY = "\033[38;5;238m"
+        
+        # Badges
+        BG_RED = "\033[48;5;196;38;5;255;1m"
+        BG_GREEN = "\033[48;5;28;38;5;255;1m"
+        BG_YELLOW = "\033[48;5;214;38;5;16;1m"
+        BG_BLUE = "\033[48;5;31;38;5;255;1m"
+    else:
+        RESET = BOLD = DIM = ITALIC = ""
+        RED = GREEN = YELLOW = BLUE = MAGENTA = CYAN = WHITE = GRAY = DARK_GRAY = ""
+        BG_RED = BG_GREEN = BG_YELLOW = BG_BLUE = ""
+
+def visible_len(s):
+    return len(re.sub(r'\x1b\[[0-9;]*m', '', s))
+
+def pad_to(s, width, align='left'):
+    v_len = visible_len(s)
+    pad = max(0, width - v_len)
+    if align == 'center':
+        left_pad = pad // 2
+        right_pad = pad - left_pad
+        return " " * left_pad + s + " " * right_pad
+    elif align == 'right':
+        return " " * pad + s
+    else:
+        return s + " " * pad
+
+def run_cmd(cmd):
     try:
-        cleaned = ' '.join(d_str.split())
-        return datetime.strptime(cleaned, '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
+        res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return res.stdout.strip()
     except Exception:
-        return None
+        return ""
 
-d1 = parse_date('''$c1_not_after''')
-d2 = parse_date('''$c2_not_after''')
-now = datetime.now(timezone.utc)
+def parse_cert(pem_path):
+    d = {}
+    d['subject_dn'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -subject -nameopt RFC2253").replace("subject=", "").strip()
+    d['issuer_dn'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -issuer -nameopt RFC2253").replace("issuer=", "").strip()
+    
+    subj_cn = run_cmd(f"openssl x509 -in '{pem_path}' -noout -subject")
+    d['subject_cn'] = subj_cn.split("CN=")[-1].split(",")[0].strip() if "CN=" in subj_cn else (d['subject_dn'] or "N/A")
+    
+    issuer_cn = run_cmd(f"openssl x509 -in '{pem_path}' -noout -issuer")
+    d['issuer_cn'] = issuer_cn.split("CN=")[-1].split(",")[0].strip() if "CN=" in issuer_cn else (d['issuer_dn'] or "N/A")
+    
+    d['serial'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -serial").replace("serial=", "").strip()
+    
+    sig_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -text | grep 'Signature Algorithm:' | head -n 1")
+    d['sig_algo'] = sig_raw.split(":")[-1].strip() if ":" in sig_raw else "N/A"
+    
+    nb_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -startdate").replace("notBefore=", "").strip()
+    na_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -enddate").replace("notAfter=", "").strip()
+    d['not_before'] = nb_raw
+    d['not_after'] = na_raw
+    
+    d['dt_not_after'] = None
+    try:
+        cleaned = " ".join(na_raw.split())
+        d['dt_not_after'] = datetime.strptime(cleaned, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+        
+    now = datetime.now(timezone.utc)
+    if d['dt_not_after']:
+        d['days_remaining'] = (d['dt_not_after'] - now).days
+        d['is_expired'] = d['days_remaining'] < 0
+    else:
+        d['days_remaining'] = 0
+        d['is_expired'] = False
 
-rem1 = (d1 - now).days if d1 else 0
-rem2 = (d2 - now).days if d2 else 0
+    txt = run_cmd(f"openssl x509 -in '{pem_path}' -noout -text")
+    pk_algo = ""
+    pk_size = ""
+    for line in txt.splitlines():
+        if "Public Key Algorithm:" in line:
+            pk_algo = line.split(":")[-1].strip()
+        elif "RSA Public-Key:" in line or "Public-Key:" in line:
+            pk_size = line.split("(")[-1].replace(")", "").strip()
+        elif "NIST CURVE:" in line or "ASN1 OID:" in line:
+            pk_size = line.split(":")[-1].strip()
+    d['pubkey_info'] = f"{pk_algo} ({pk_size})" if pk_size else (pk_algo or "Unknown")
+    d['pubkey_algo'] = pk_algo
+    d['pubkey_size'] = pk_size
+    
+    d['pubkey_hash'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -pubkey | openssl sha256 | awk '{{print $NF}}'")
+    d['sha256'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -fingerprint -sha256").split("=")[-1].strip()
+    d['sha1'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -fingerprint -sha1").split("=")[-1].strip()
+    
+    d['key_usage'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext keyUsage | grep -v 'Key Usage'").strip()
+    d['ext_key_usage'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext extendedKeyUsage | grep -v 'Extended Key Usage'").strip()
+    d['basic_constraints'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext basicConstraints | grep -v 'Basic Constraints'").strip()
+    d['ocsp'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ocsp_uri")
+    
+    san_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext subjectAltName | grep -v 'Subject Alternative Name'")
+    sans = []
+    if san_raw:
+        for item in san_raw.split(","):
+            val = item.strip()
+            if val:
+                sans.append(val)
+    d['sans'] = sorted(list(set(sans)))
+    return d
 
-delta_days = (d2 - d1).days if (d1 and d2) else 0
+c1 = parse_cert(cert1_pem)
+c2 = parse_cert(cert2_pem)
 
-newer = 'true' if (d2 and d1 and d2 > d1) else 'false'
-older = 'true' if (d2 and d1 and d2 < d1) else 'false'
-same = 'true' if (d2 and d1 and d2 == d1) else 'false'
+# SAN Sets
+s1 = set(c1['sans'])
+s2 = set(c2['sans'])
+common_sans = sorted(list(s1 & s2))
+removed_sans = sorted(list(s1 - s2))
+added_sans = sorted(list(s2 - s1))
+all_unique_sans = sorted(list(s1 | s2))
 
-print(f'REM1={rem1};REM2={rem2};DELTA_DAYS={delta_days};NEWER={newer};OLDER={older};SAME_DATE={same}')
-")
+c1_san_count = len(c1['sans'])
+c2_san_count = len(c2['sans'])
+common_count = len(common_sans)
+removed_count = len(removed_sans)
+added_count = len(added_sans)
+san_diff_count = removed_count + added_count
 
-eval "$DATE_EVAL"
+params_to_compare = [
+    ("Subject CN", c1['subject_cn'], c2['subject_cn']),
+    ("Subject DN", c1['subject_dn'], c2['subject_dn']),
+    ("Issuer CN", c1['issuer_cn'], c2['issuer_cn']),
+    ("Issuer DN", c1['issuer_dn'], c2['issuer_dn']),
+    ("Serial Number", c1['serial'], c2['serial']),
+    ("Signature Algorithm", c1['sig_algo'], c2['sig_algo']),
+    ("Public Key", c1['pubkey_info'], c2['pubkey_info']),
+    ("Valid From", c1['not_before'], c2['not_before']),
+    ("Valid Until (Expiry)", c1['not_after'], c2['not_after']),
+    ("Validity Status", 
+     f"{'EXPIRED' if c1['is_expired'] else 'VALID'} ({c1['days_remaining']}d left)", 
+     f"{'EXPIRED' if c2['is_expired'] else 'VALID'} ({c2['days_remaining']}d left)"),
+    ("Key Usage", c1['key_usage'] or "<None>", c2['key_usage'] or "<None>"),
+    ("Ext Key Usage (EKU)", c1['ext_key_usage'] or "<None>", c2['ext_key_usage'] or "<None>"),
+    ("Basic Constraints", c1['basic_constraints'] or "<None>", c2['basic_constraints'] or "<None>"),
+    ("OCSP Responder", c1['ocsp'] or "<None>", c2['ocsp'] or "<None>"),
+    ("SHA-256 Fingerprint", c1['sha256'], c2['sha256']),
+]
 
-if [[ "$QUIET" == true ]]; then
-    if [[ $SAN_DIFF_COUNT -eq 0 && "$c1_sha256" == "$c2_sha256" ]]; then
-        exit 0
-    else
-        exit 1
-    fi
-fi
+param_diffs = sum(1 for _, v1, v2 in params_to_compare if v1 != v2)
+param_total = len(params_to_compare)
+
+if quiet:
+    sys.exit(0 if (param_diffs == 0 and san_diff_count == 0) else 1)
 
 # ------------------------------------------------------------------------------
-# Banner & Targets
+# 1. TOP HEADER & METRIC DASHBOARD
 # ------------------------------------------------------------------------------
-echo ""
-echo -e "${BOLD}${CYAN}========================================================================================================${RESET}"
-echo -e "${BOLD}${CYAN}                            🔐 X.509 CERTIFICATE & SAN COMPARISON REPORT                               ${RESET}"
-echo -e "${BOLD}${CYAN}========================================================================================================${RESET}"
-echo -e "  ${BOLD}Cert [1]:${RESET} ${YELLOW}${TARGET1}${RESET}"
-echo -e "  ${BOLD}Cert [2]:${RESET} ${YELLOW}${TARGET2}${RESET}"
-echo -e "${CYAN}--------------------------------------------------------------------------------------------------------${RESET}"
+print()
+banner_title = "🔐  X.509 CERTIFICATE & SAN COMPARISON REPORT"
+inner_w = total_width - 4
 
-# ------------------------------------------------------------------------------
-# Parameter Diff Section (if not SAN-only)
-# ------------------------------------------------------------------------------
-if [[ "$SAN_ONLY" == false ]]; then
-    echo -e "\n${BOLD}${MAGENTA}--- [ 1. General Certificate Parameters ] ---${RESET}"
-    compare_field "Subject CN" "$c1_subject_cn" "$c2_subject_cn"
-    compare_field "Subject (Full DN)" "$c1_subject" "$c2_subject"
-    compare_field "Issuer CN" "$c1_issuer_cn" "$c2_issuer_cn"
-    compare_field "Issuer (Full DN)" "$c1_issuer" "$c2_issuer"
-    compare_field "Serial Number" "$c1_serial" "$c2_serial"
-    compare_field "Signature Algorithm" "$c1_sig_algo" "$c2_sig_algo"
-    compare_field "Public Key" "$c1_pubkey_info" "$c2_pubkey_info"
-    compare_field "Not Before (Start)" "$c1_not_before" "$c2_not_before"
-    compare_field "Not After (Expiry)" "$c1_not_after" "$c2_not_after"
-    compare_field "Validity Status" "$c1_status ($REM1 days rem.)" "$c2_status ($REM2 days rem.)"
-    compare_field "Key Usage" "$c1_key_usage" "$c2_key_usage"
-    compare_field "Ext Key Usage (EKU)" "$c1_ext_key_usage" "$c2_ext_key_usage"
-    compare_field "Basic Constraints" "$c1_basic_constraints" "$c2_basic_constraints"
-    compare_field "OCSP Responder" "$c1_ocsp" "$c2_ocsp"
-    compare_field "Subject Key ID (SKI)" "$c1_ski" "$c2_ski"
-    compare_field "Authority Key ID (AKI)" "$c1_aki" "$c2_aki"
-    compare_field "SHA-256 Fingerprint" "$c1_sha256" "$c2_sha256"
-fi
+print(f"{C.CYAN}╭" + "─" * (total_width - 2) + f"╮{C.RESET}")
+print(f"{C.CYAN}│{C.RESET} {pad_to(f'{C.BOLD}{C.WHITE}{banner_title}{C.RESET}', inner_w, 'center')} {C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}├" + "─" * (total_width - 2) + f"┤{C.RESET}")
+
+line_t1 = f"  {C.BOLD}Cert [1] (Left):{C.RESET}  {C.YELLOW}{target1}{C.RESET}"
+line_t2 = f"  {C.BOLD}Cert [2] (Right):{C.RESET} {C.YELLOW}{target2}{C.RESET}"
+print(f"{C.CYAN}│{C.RESET} {pad_to(line_t1, inner_w)} {C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}│{C.RESET} {pad_to(line_t2, inner_w)} {C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}├" + "─" * (total_width - 2) + f"┤{C.RESET}")
+
+diff_badge = f"{C.RED}{C.BOLD}{param_diffs} Parameter Diff(s){C.RESET}" if param_diffs > 0 else f"{C.GREEN}{C.BOLD}All Params Match{C.RESET}"
+san_match_badge = f"{C.GREEN}{common_count} Common SANs{C.RESET}"
+san_add_badge = f"{C.CYAN}+{added_count} Added{C.RESET}" if added_count > 0 else f"{C.GRAY}0 Added{C.RESET}"
+san_rem_badge = f"{C.RED}-{removed_count} Removed{C.RESET}" if removed_count > 0 else f"{C.GRAY}0 Removed{C.RESET}"
+
+dash_line = f"  📊 {C.BOLD}STATUS DASHBOARD:{C.RESET}  {diff_badge}   │   {san_match_badge}   │   {san_add_badge}   │   {san_rem_badge}"
+print(f"{C.CYAN}│{C.RESET} {pad_to(dash_line, inner_w)} {C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}╰" + "─" * (total_width - 2) + f"╯{C.RESET}")
 
 # ------------------------------------------------------------------------------
-# SIDE-BY-SIDE SAN COMPARISON TABLE
+# 2. GENERAL PARAMETERS SIDE-BY-SIDE TABLE
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${MAGENTA}--- [ 2. Subject Alternative Name (SAN) Side-by-Side Comparison ] ---${RESET}"
-echo -e "  • Total in Cert [1]: ${BOLD}${C1_SAN_COUNT}${RESET}  |  • Total in Cert [2]: ${BOLD}${C2_SAN_COUNT}${RESET}  |  • Common: ${GREEN}${BOLD}${COMMON_COUNT}${RESET}  |  • Added: ${CYAN}${BOLD}+${ADDED_COUNT}${RESET}  |  • Removed: ${RED}${BOLD}-${REMOVED_COUNT}${RESET}\n"
+if not san_only:
+    print()
+    sec1_title = "1. GENERAL PARAMETERS COMPARISON"
+    p_name_w = 22
+    p_val_w = (total_width - p_name_w - 12) // 2
+    
+    t_top = f"╭─ {C.BOLD}{C.WHITE}{sec1_title}{C.RESET} " + "─" * max(0, total_width - len(sec1_title) - 5) + "╮"
+    t_head = f"│ {pad_to(f'{C.BOLD}{C.CYAN}PARAMETER{C.RESET}', p_name_w)} │ {pad_to(f'{C.BOLD}{C.WHITE}CERT [1] (Left){C.RESET}', p_val_w)} │ {'DIFF':^4} │ {pad_to(f'{C.BOLD}{C.WHITE}CERT [2] (Right){C.RESET}', p_val_w)} │"
+    t_sep = f"├" + "─" * (p_name_w + 2) + "┼" + "─" * (p_val_w + 2) + "┼" + "─" * 6 + "┼" + "─" * (p_val_w + 2) + "┤"
+    t_bot = f"╰" + "─" * (p_name_w + 2) + "┴" + "─" * (p_val_w + 2) + "┴" + "─" * 6 + "┴" + "─" * (p_val_w + 2) + "╯"
 
-# Run Python side-by-side table renderer
-python3 -c "
-import os
-import sys
+    print(f"{C.CYAN}{t_top}{C.RESET}")
+    print(f"{C.CYAN}{t_head}{C.RESET}")
+    print(f"{C.CYAN}{t_sep}{C.RESET}")
 
-c1_file = '''$C1_SAN_FILE'''
-c2_file = '''$C2_SAN_FILE'''
-target1 = '''$TARGET1'''
-target2 = '''$TARGET2'''
-use_color = os.environ.get('NO_COLOR') is None
+    for name, v1, v2 in params_to_compare:
+        v1_clean = v1 if v1 else "<None>"
+        v2_clean = v2 if v2 else "<None>"
+        
+        v1_disp = v1_clean if len(v1_clean) <= p_val_w else (v1_clean[:p_val_w-3] + "...")
+        v2_disp = v2_clean if len(v2_clean) <= p_val_w else (v2_clean[:p_val_w-3] + "...")
+        
+        if v1_clean == v2_clean:
+            tag = f"{C.GREEN} =  {C.RESET}"
+            v1_col = pad_to(f"{C.GRAY}{v1_disp}{C.RESET}", p_val_w)
+            v2_col = pad_to(f"{C.GRAY}{v2_disp}{C.RESET}", p_val_w)
+            p_col = pad_to(f"{C.WHITE}{name}{C.RESET}", p_name_w)
+        else:
+            tag = f"{C.RED}{C.BOLD} ≠  {C.RESET}"
+            v1_col = pad_to(f"{C.RED}{v1_disp}{C.RESET}", p_val_w)
+            v2_col = pad_to(f"{C.GREEN}{v2_disp}{C.RESET}", p_val_w)
+            p_col = pad_to(f"{C.YELLOW}{C.BOLD}{name}{C.RESET}", p_name_w)
+            
+        print(f"{C.CYAN}│{C.RESET} {p_col} {C.CYAN}│{C.RESET} {v1_col} {C.CYAN}│{C.RESET} {tag} {C.CYAN}│{C.RESET} {v2_col} {C.CYAN}│{C.RESET}")
 
-with open(c1_file, 'r') as f:
-    c1_sans = [line.strip() for line in f if line.strip()]
+    print(f"{C.CYAN}{t_bot}{C.RESET}")
 
-with open(c2_file, 'r') as f:
-    c2_sans = [line.strip() for line in f if line.strip()]
+# ------------------------------------------------------------------------------
+# 3. SIDE-BY-SIDE SUBJECT ALTERNATIVE NAMES (SAN) TABLE
+# ------------------------------------------------------------------------------
+print()
+sec2_title = "2. SUBJECT ALTERNATIVE NAMES (SAN) SIDE-BY-SIDE"
+san_col_w = (total_width - 10) // 2
 
-c1_set = set(c1_sans)
-c2_set = set(c2_sans)
-all_sans = sorted(list(c1_set | c2_set))
+s_top = f"╭─ {C.BOLD}{C.WHITE}{sec2_title}{C.RESET} " + "─" * max(0, total_width - len(sec2_title) - 5) + "╮"
+s_h1 = f"Cert [1] SANs ({c1_san_count})"
+s_h2 = f"Cert [2] SANs ({c2_san_count})"
+s_head = f"│ {pad_to(f'{C.BOLD}{C.WHITE}{s_h1}{C.RESET}', san_col_w)} │ {'STAT':^4} │ {pad_to(f'{C.BOLD}{C.WHITE}{s_h2}{C.RESET}', san_col_w)} │"
+s_sep = f"├" + "─" * (san_col_w + 2) + "┼" + "─" * 6 + "┼" + "─" * (san_col_w + 2) + "┤"
+s_bot = f"╰" + "─" * (san_col_w + 2) + "┴" + "─" * 6 + "┴" + "─" * (san_col_w + 2) + "╯"
 
-# Color helpers
-def colorize(text, color_code):
-    if not use_color:
-        return text
-    return f'\033[{color_code}m{text}\033[0m'
+print(f"{C.CYAN}{s_top}{C.RESET}")
+print(f"{C.CYAN}{s_head}{C.RESET}")
+print(f"{C.CYAN}{s_sep}{C.RESET}")
 
-# Column widths
-term_cols = 104
-col_w = 46
-
-header_c1 = f'Cert [1]: {target1}'[:col_w]
-header_c2 = f'Cert [2]: {target2}'[:col_w]
-
-border = '+' + '-' * (col_w + 2) + '+' + '-' * 8 + '+' + '-' * (col_w + 2) + '+'
-header = f'| {header_c1:<{col_w}} |  Diff  | {header_c2:<{col_w}} |'
-
-print(colorize(border, '36'))
-print(colorize(header, '1;37'))
-print(colorize(border, '36'))
-
-if not all_sans:
-    empty_row = f'| {\"<No SANs Found>\":<{col_w}} |  ==    | {\"<No SANs Found>\":<{col_w}} |'
-    print(empty_row)
+if not all_unique_sans:
+    no_san_msg = pad_to(f"{C.GRAY}<No Subject Alternative Names Found>{C.RESET}", san_col_w)
+    print(f"{C.CYAN}│{C.RESET} {no_san_msg} {C.CYAN}│{C.RESET} {C.GRAY} == {C.RESET} {C.CYAN}│{C.RESET} {no_san_msg} {C.CYAN}│{C.RESET}")
 else:
-    for san in all_sans:
-        in_c1 = san in c1_set
-        in_c2 = san in c2_set
-        san_display = san[:col_w]
-
+    for san in all_unique_sans:
+        in_c1 = san in s1
+        in_c2 = san in s2
+        
+        san_disp = san if len(san) <= san_col_w else (san[:san_col_w-3] + "...")
+        placeholder = "· " * ((san_col_w // 2) - 1)
+        
         if in_c1 and in_c2:
-            diff_tag = colorize('  ==  ', '32;1')
-            left_txt = colorize(f'{san_display:<{col_w}}', '32')
-            right_txt = colorize(f'{san_display:<{col_w}}', '32')
-            print(f'| {left_txt} | {diff_tag} | {right_txt} |')
+            tag = f"{C.GREEN}{C.BOLD} == {C.RESET}"
+            left_side = pad_to(f"{C.GREEN}{san_disp}{C.RESET}", san_col_w)
+            right_side = pad_to(f"{C.GREEN}{san_disp}{C.RESET}", san_col_w)
         elif in_c1 and not in_c2:
-            diff_tag = colorize('  --  ', '31;1')
-            left_txt = colorize(f'{san_display:<{col_w}}', '31;1')
-            not_in_2 = '<Removed in Cert 2>'[:col_w]
-            right_txt = colorize(f'{not_in_2:<{col_w}}', '2;31')
-            print(f'| {left_txt} | {diff_tag} | {right_txt} |')
+            tag = f"{C.RED}{C.BOLD} -  {C.RESET}"
+            left_side = pad_to(f"{C.RED}{C.BOLD}{san_disp}{C.RESET}", san_col_w)
+            right_side = pad_to(f"{C.DARK_GRAY}{placeholder}{C.RESET}", san_col_w)
         elif not in_c1 and in_c2:
-            diff_tag = colorize('  ++  ', '36;1')
-            not_in_1 = '<Not in Cert 1>'[:col_w]
-            left_txt = colorize(f'{not_in_1:<{col_w}}', '2;36')
-            right_txt = colorize(f'{san_display:<{col_w}}', '36;1')
-            print(f'| {left_txt} | {diff_tag} | {right_txt} |')
+            tag = f"{C.CYAN}{C.BOLD} +  {C.RESET}"
+            left_side = pad_to(f"{C.DARK_GRAY}{placeholder}{C.RESET}", san_col_w)
+            right_side = pad_to(f"{C.CYAN}{C.BOLD}{san_disp}{C.RESET}", san_col_w)
 
-print(colorize(border, '36'))
-"
+        print(f"{C.CYAN}│{C.RESET} {left_side} {C.CYAN}│{C.RESET} {tag} {C.CYAN}│{C.RESET} {right_side} {C.CYAN}│{C.RESET}")
+
+print(f"{C.CYAN}{s_bot}{C.RESET}")
 
 # ------------------------------------------------------------------------------
-# Multi-Dimensional Intelligence Verdict Analysis
+# 4. EXECUTIVE VERDICT & RISK ASSESSMENT CARD
 # ------------------------------------------------------------------------------
-echo ""
-echo -e "${CYAN}========================================================================================================${RESET}"
-echo -e "${BOLD}${CYAN}                                📊 COMPREHENSIVE VERDICT & RISK ANALYSIS                                ${RESET}"
-echo -e "${CYAN}========================================================================================================${RESET}"
+print()
+sec3_title = "3. EXECUTIVE VERDICT & RISK ASSESSMENT"
+v_top = f"╭─ {C.BOLD}{C.WHITE}{sec3_title}{C.RESET} " + "─" * max(0, total_width - len(sec3_title) - 5) + "╮"
+v_bot = f"╰" + "─" * (total_width - 2) + "╯"
 
-# Determine Scenario Category
-SCENARIO=""
-RISK_LEVEL=""
-RISK_COLOR=""
-SUMMARY_TITLE=""
+if c1['sha256'] == c2['sha256']:
+    scenario_title = "🎯 EXACT IDENTICAL CERTIFICATE"
+    risk_pill = f"{C.BG_GREEN} RISK: NONE (IDENTICAL ISSUE) {C.RESET}"
+    action_item = f"{C.GREEN}✔ No action required.{C.RESET} Both targets serve the exact same cryptographic certificate."
+elif common_count == 0 and c1_san_count > 0 and c2_san_count > 0:
+    scenario_title = "❌ COMPLETELY DISJOINT / UNRELATED CERTIFICATES"
+    risk_pill = f"{C.BG_RED} RISK: HIGH (INCOMPATIBLE TARGETS) {C.RESET}"
+    action_item = f"{C.RED}✖ Incompatible targets.{C.RESET} Do not swap these certificates; they serve completely separate services."
+elif san_diff_count == 0:
+    if c2['days_remaining'] < c1['days_remaining']:
+        scenario_title = "⚠️ EXPIRATION REGRESSION DETECTED"
+        risk_pill = f"{C.BG_RED} RISK: HIGH (LIFETIME REGRESSION) {C.RESET}"
+        action_item = f"{C.RED}✖ Caution!{C.RESET} Cert [2] expires earlier than Cert [1]. Verify you are not deploying an older archive cert."
+    elif c1['is_expired'] and not c2['is_expired']:
+        scenario_title = "🔄 EXPIRED CERTIFICATE REPLACEMENT"
+        risk_pill = f"{C.BG_GREEN} RISK: LOW (CRITICAL RESTORATION) {C.RESET}"
+        action_item = f"{C.GREEN}✔ Deploy immediately.{C.RESET} Restore valid HTTPS trust on your ingress / load balancer."
+    else:
+        scenario_title = "🔄 SEAMLESS CERTIFICATE RENEWAL / RE-ISSUANCE"
+        risk_pill = f"{C.BG_GREEN} RISK: LOW (SAFE TO DEPLOY) {C.RESET}"
+        action_item = f"{C.GREEN}✔ Safe for deployment.{C.RESET} Seamless drop-in replacement on Load Balancers, Ingress, and CDNs."
+elif removed_count == 0 and added_count > 0:
+    scenario_title = f"📈 BACKWARDS-COMPATIBLE SAN EXPANSION (+{added_count} New Domains)"
+    risk_pill = f"{C.BG_BLUE} RISK: LOW-MEDIUM (SAFE FOR EXISTING TRAFFIC) {C.RESET}"
+    action_item = f"{C.GREEN}✔ Safe for current traffic.{C.RESET} Ensure DNS records for new SANs point to this endpoint before routing new traffic."
+elif removed_count > 0 and added_count == 0:
+    scenario_title = f"🚨 SAN CONTRACTION / REMOVAL ({removed_count} Domains Lost!)"
+    risk_pill = f"{C.BG_RED} RISK: CRITICAL (BREAKING OUTAGE RISK) {C.RESET}"
+    action_item = f"{C.RED}✖ DO NOT DEPLOY!{C.RESET} Active traffic hitting removed hostnames will experience immediate TLS handshake failures."
+else:
+    scenario_title = f"🔀 SAN OVERHAUL / PARTIAL DRIFT (+{added_count} Added, -{removed_count} Removed)"
+    risk_pill = f"{C.BG_YELLOW} RISK: HIGH (PARTIAL OUTAGE RISK) {C.RESET}"
+    action_item = f"{C.YELLOW}⚠ Audit required.{C.RESET} Verify decommissioned status of removed domains before rotating."
 
-# 1. Exact Duplicate
-if [[ "$c1_sha256" == "$c2_sha256" ]]; then
-    SCENARIO="IDENTICAL"
-    RISK_LEVEL="NONE"
-    RISK_COLOR="$GREEN"
-    SUMMARY_TITLE="🎯 EXACT IDENTICAL CERTIFICATE (Same Fingerprint & Serial)"
+print(f"{C.CYAN}{v_top}{C.RESET}")
+print(f"{C.CYAN}│{C.RESET} {pad_to(f' {C.BOLD}VERDICT:{C.RESET}     {C.BOLD}{C.WHITE}{scenario_title}{C.RESET}', inner_w)} {C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}│{C.RESET} {pad_to(f' {C.BOLD}RISK LEVEL:{C.RESET}  {risk_pill}', inner_w)} {C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}│{C.RESET}" + " " * (inner_w + 2) + f"{C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}│{C.RESET} {pad_to(f' {C.BOLD}{C.WHITE}🔍 Key Lifecycle Insights:{C.RESET}', inner_w)} {C.CYAN}│{C.RESET}")
 
-# 2. Complete Disjoint (No shared domains)
-elif [[ "$COMMON_COUNT" -eq 0 && "$C1_SAN_COUNT" -gt 0 && "$C2_SAN_COUNT" -gt 0 ]]; then
-    SCENARIO="DISJOINT"
-    RISK_LEVEL="HIGH (INCOMPATIBLE TARGETS)"
-    RISK_COLOR="$RED"
-    SUMMARY_TITLE="❌ COMPLETELY DISJOINT / UNRELATED CERTIFICATES"
+# Insights
+if san_diff_count == 0:
+    san_msg = f"   • {C.GREEN}SAN Continuity:{C.RESET}  100% Match ({c1_san_count}/{c1_san_count} domains preserved)."
+elif removed_count == 0:
+    san_msg = f"   • {C.GREEN}SAN Continuity:{C.RESET}  Backwards-Compatible ({common_count} preserved, +{added_count} new)."
+elif common_count == 0:
+    san_msg = f"   • {C.RED}SAN Continuity:{C.RESET}  0% Overlap (No shared domains)."
+else:
+    san_msg = f"   • {C.YELLOW}SAN Continuity:{C.RESET}  Partial ({common_count} kept, +{added_count} added, {C.RED}-{removed_count} lost{C.RESET})."
+print(f"{C.CYAN}│{C.RESET} {pad_to(san_msg, inner_w)} {C.CYAN}│{C.RESET}")
 
-# 3. Seamless Renewal (Same SANs, valid newer dates or rotated key/serial)
-elif [[ "$SAN_DIFF_COUNT" -eq 0 ]]; then
-    if [[ "$OLDER" == "true" ]]; then
-        SCENARIO="RENEWAL_REGRESSION"
-        RISK_LEVEL="HIGH (EXPIRATION REGRESSION)"
-        RISK_COLOR="$RED"
-        SUMMARY_TITLE="⚠️ LIFETIME REGRESSION (Cert [2] expires earlier than Cert [1])"
-    elif [[ "$c1_status" == "EXPIRED" && "$c2_status" == "VALID" ]]; then
-        SCENARIO="EXPIRED_REPLACEMENT"
-        RISK_LEVEL="LOW (MANDATORY UPDATE)"
-        RISK_COLOR="$GREEN"
-        SUMMARY_TITLE="🔄 EXPIRED CERTIFICATE REPLACEMENT (Cert [1] is Expired)"
-    else
-        SCENARIO="RENEWAL_SEAMLESS"
-        RISK_LEVEL="LOW (SAFE TO DEPLOY)"
-        RISK_COLOR="$GREEN"
-        SUMMARY_TITLE="🔄 SEAMLESS CERTIFICATE RENEWAL / RE-ISSUANCE"
-    fi
+if c1['dt_not_after'] and c2['dt_not_after']:
+    delta_days = (c2['dt_not_after'] - c1['dt_not_after']).days
+    if delta_days > 0:
+        val_msg = f"   • {C.GREEN}Validity Delta:{C.RESET}  Cert [2] extends lifespan by {C.BOLD}+{delta_days} days{C.RESET} ({c2['days_remaining']}d remaining)."
+    elif delta_days < 0:
+        val_msg = f"   • {C.RED}Validity Delta:{C.RESET}  Cert [2] expires {C.BOLD}{abs(delta_days)} days SOONER{C.RESET} than Cert [1]."
+    else:
+        val_msg = f"   • {C.GRAY}Validity Delta:{C.RESET}  Both certificates share the exact same expiry date."
+    print(f"{C.CYAN}│{C.RESET} {pad_to(val_msg, inner_w)} {C.CYAN}│{C.RESET}")
 
-# 4. Safe SAN Expansion (0 removed, N added)
-elif [[ "$REMOVED_COUNT" -eq 0 && "$ADDED_COUNT" -gt 0 ]]; then
-    SCENARIO="SAN_EXPANSION"
-    RISK_LEVEL="LOW-MEDIUM (BACKWARDS COMPATIBLE)"
-    RISK_COLOR="$GREEN"
-    SUMMARY_TITLE="📈 SAN EXPANSION (All original domains preserved + $ADDED_COUNT new)"
+if c1['pubkey_hash'] == c2['pubkey_hash'] and c1['pubkey_hash']:
+    key_msg = f"   • {C.GRAY}Private Key:{C.RESET}     Re-used identical underlying key pair."
+else:
+    key_msg = f"   • {C.CYAN}Private Key:{C.RESET}     Rotated to a fresh cryptographic key pair."
+print(f"{C.CYAN}│{C.RESET} {pad_to(key_msg, inner_w)} {C.CYAN}│{C.RESET}")
 
-# 5. Breaking SAN Contraction (N removed, 0 added)
-elif [[ "$REMOVED_COUNT" -gt 0 && "$ADDED_COUNT" -eq 0 ]]; then
-    SCENARIO="SAN_CONTRACTION"
-    RISK_LEVEL="CRITICAL (BREAKING CHANGE - DOMAINS LOST)"
-    RISK_COLOR="$RED"
-    SUMMARY_TITLE="🚨 SAN CONTRACTION / REMOVAL ($REMOVED_COUNT domains removed)"
+if c1['pubkey_info'] != c2['pubkey_info']:
+    crypto_msg = f"   • {C.MAGENTA}Crypto Shift:{C.RESET}    {c1['pubkey_info']} ➔ {c2['pubkey_info']}"
+    print(f"{C.CYAN}│{C.RESET} {pad_to(crypto_msg, inner_w)} {C.CYAN}│{C.RESET}")
 
-# 6. Mixed SAN Overhaul
-else
-    SCENARIO="SAN_OVERHAUL"
-    RISK_LEVEL="HIGH (COMPLEX DRIFT)"
-    RISK_COLOR="$YELLOW"
-    SUMMARY_TITLE="🔀 SAN OVERHAUL / PARTIAL DRIFT (+$ADDED_COUNT added, -$REMOVED_COUNT removed)"
-fi
+if c1['issuer_dn'] != c2['issuer_dn']:
+    ca_msg = f"   • {C.CYAN}CA Authority:{C.RESET}    Migrated from '{c1['issuer_cn']}' ➔ '{c2['issuer_cn']}'"
+    print(f"{C.CYAN}│{C.RESET} {pad_to(ca_msg, inner_w)} {C.CYAN}│{C.RESET}")
 
-# Print Primary Verdict Header
-echo -e "  ${BOLD}Verdict Category:${RESET}  ${BOLD}${SUMMARY_TITLE}${RESET}"
-echo -e "  ${BOLD}Deployment Risk:${RESET}   ${RISK_COLOR}${BOLD}[ ${RISK_LEVEL} ]${RESET}\n"
+print(f"{C.CYAN}│{C.RESET}" + " " * (inner_w + 2) + f"{C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}│{C.RESET} {pad_to(f' {C.BOLD}{C.WHITE}📋 Actionable Recommendation:{C.RESET}', inner_w)} {C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}│{C.RESET} {pad_to(f'   {action_item}', inner_w)} {C.CYAN}│{C.RESET}")
+print(f"{C.CYAN}{v_bot}{C.RESET}\n")
 
-# Print Key Analytical Insights
-echo -e "  ${BOLD}${WHITE}🔍 Key Lifecycle Insights:${RESET}"
-
-# 1. SAN Insight
-if [[ "$SAN_DIFF_COUNT" -eq 0 ]]; then
-    echo -e "    • ${GREEN}SAN Continuity:${RESET}  100% match. All ${C1_SAN_COUNT} domain(s) fully preserved in side-by-side alignment."
-elif [[ "$REMOVED_COUNT" -eq 0 ]]; then
-    echo -e "    • ${GREEN}SAN Continuity:${RESET}  Backwards-compatible. All ${COMMON_COUNT} existing domains preserved + ${ADDED_COUNT} added."
-elif [[ "$COMMON_COUNT" -eq 0 ]]; then
-    echo -e "    • ${RED}SAN Continuity:${RESET}  0% overlap. No shared Subject Alternative Names."
-else
-    echo -e "    • ${YELLOW}SAN Continuity:${RESET}  Partial overlap (${COMMON_COUNT} preserved, ${ADDED_COUNT} new, ${RED}${REMOVED_COUNT} dropped${RESET})."
-fi
-
-# 2. Validity / Expiry Insight
-if [[ "$SAME_DATE" == "true" ]]; then
-    echo -e "    • ${DIM}Validity Period:${RESET} Both certificates share the exact same expiry (${c2_not_after})."
-elif [[ "$NEWER" == "true" ]]; then
-    echo -e "    • ${GREEN}Validity Delta:${RESET}  Cert [2] extends coverage by ${BOLD}+${DELTA_DAYS} days${RESET} (Expires: ${c2_not_after}, ${REM2} days remaining)."
-elif [[ "$OLDER" == "true" ]]; then
-    echo -e "    • ${RED}Validity Delta:${RESET}  Cert [2] expires ${BOLD}${DELTA_DAYS#-} days SOONER${RESET} than Cert [1] (Expires: ${c2_not_after})."
-fi
-
-# 3. Cryptographic Key Insight
-if [[ "$c1_pubkey_modulus" == "$c2_pubkey_modulus" && -n "$c1_pubkey_modulus" ]]; then
-    echo -e "    • ${DIM}Private Key Pair:${RESET} Shared (Re-issued with the SAME underlying private key)."
-else
-    echo -e "    • ${CYAN}Private Key Pair:${RESET} Rotated (Issued with a fresh, distinct cryptographic key pair)."
-fi
-
-# 4. Crypto Algorithm Evolution
-if [[ "$c1_pubkey_info" != "$c2_pubkey_info" ]]; then
-    if [[ "$c1_pubkey_algo" =~ rsa && "$c2_pubkey_algo" =~ (ec|ECDSA) ]]; then
-        echo -e "    • ${GREEN}Crypto Modernization:${RESET} Upgraded from RSA ➔ ECDSA (Higher security, faster TLS handshakes)."
-    elif [[ "$c1_pubkey_algo" =~ (ec|ECDSA) && "$c2_pubkey_algo" =~ rsa ]]; then
-        echo -e "    • ${YELLOW}Crypto Migration:${RESET} Changed from ECDSA ➔ RSA (Legacy compatibility mode)."
-    else
-        echo -e "    • ${CYAN}Crypto Migration:${RESET} Key parameters changed (${c1_pubkey_info} ➔ ${c2_pubkey_info})."
-    fi
-fi
-
-# 5. CA / Issuer Evolution
-if [[ "$c1_issuer" != "$c2_issuer" ]]; then
-    echo -e "    • ${CYAN}CA Migration:${RESET}     Issued by different Certificate Authority:"
-    echo -e "                       From: ${c1_issuer_cn:-$c1_issuer}"
-    echo -e "                       To:   ${c2_issuer_cn:-$c2_issuer}"
-fi
-
-# Print Specific Risk & Action Recommendations
-echo -e "\n  ${BOLD}${WHITE}📋 Actionable Recommendation:${RESET}"
-case "$SCENARIO" in
-    "IDENTICAL")
-        echo -e "    ${GREEN}✔ No action needed.${RESET} Both files/endpoints present the exact same certificate."
-        ;;
-    "RENEWAL_SEAMLESS")
-        echo -e "    ${GREEN}✔ Safe for immediate deployment.${RESET} Rotate on Load Balancers, Ingress Gateways, and CDNs without traffic risk."
-        ;;
-    "EXPIRED_REPLACEMENT")
-        echo -e "    ${GREEN}✔ Critical renewal.${RESET} Deploy immediately to replace the expired certificate and restore valid HTTPS trust."
-        ;;
-    "RENEWAL_REGRESSION")
-        echo -e "    ${RED}✖ Review required.${RESET} Cert [2] has an earlier expiration date. Verify you are not accidentally deploying an older archive cert."
-        ;;
-    "SAN_EXPANSION")
-        echo -e "    ${GREEN}✔ Safe for existing traffic.${RESET} Verify DNS A/CNAME records point to your load balancer for newly added SANs before routing new traffic."
-        ;;
-    "SAN_CONTRACTION")
-        echo -e "    ${RED}✖ DANGER OF OUTAGE!${RESET} Domain(s) were removed in Cert [2] (see '--' entries in the table above)."
-        echo -e "      ${RED}Do NOT deploy if production traffic is still actively hitting these removed hostnames!${RESET}"
-        ;;
-    "SAN_OVERHAUL")
-        echo -e "    ${YELLOW}⚠ Audit traffic routing.${RESET} Ensure removed domains are decommissioned and new domains have active DNS bindings."
-        ;;
-    "DISJOINT")
-        echo -e "    ${RED}✖ Incompatible certificates.${RESET} These certificates belong to completely separate services or domains."
-        ;;
-esac
-
-echo -e "${CYAN}========================================================================================================${RESET}\n"
-
-if [[ "$SCENARIO" == "IDENTICAL" || "$SCENARIO" == "RENEWAL_SEAMLESS" || "$SCENARIO" == "EXPIRED_REPLACEMENT" || "$SCENARIO" == "SAN_EXPANSION" ]]; then
-    exit 0
-else
-    exit 1
-fi
+if scenario_title.startswith("❌") or "CRITICAL" in risk_pill or "LIFETIME REGRESSION" in scenario_title:
+    sys.exit(1)
+else:
+    sys.exit(0)
+EOF
