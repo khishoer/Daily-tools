@@ -18,8 +18,11 @@ openssl req -new -x509 -key "$DIR/key1.pem" -out "$DIR/hosted_baseline.pem" -day
 openssl req -new -x509 -key "$DIR/key2.pem" -out "$DIR/renewal_candidate.pem" -days 90 -subj "/CN=prod.example.com" \
   -addext "subjectAltName=DNS:prod.example.com,DNS:api.example.com,DNS:www.example.com,DNS:dev.example.com"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$SCRIPT_DIR/../san-compare.sh"
+
 echo -e "\n==================== TEST A: NORMAL ORDER (Baseline first, Candidate second) ===================="
-/Users/kishorekumarmurugan/tools/Daily-tools/scripts/san-compare.sh "$DIR/hosted_baseline.pem" "$DIR/renewal_candidate.pem" || true
+"$BIN" "$DIR/hosted_baseline.pem" "$DIR/renewal_candidate.pem" || true
 
 echo -e "\n==================== TEST B: REVERSE ORDER (Candidate first, Baseline second) ===================="
-/Users/kishorekumarmurugan/tools/Daily-tools/scripts/san-compare.sh "$DIR/renewal_candidate.pem" "$DIR/hosted_baseline.pem" || true
+"$BIN" "$DIR/renewal_candidate.pem" "$DIR/hosted_baseline.pem" || true

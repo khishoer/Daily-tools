@@ -25,8 +25,11 @@ openssl req -new -x509 -key "$DIR/key2.pem" -out "$DIR/c3_nocertauth.pem" -days 
   -addext "subjectAltName=DNS:api.internal.net" \
   -addext "extendedKeyUsage=codeSigning"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$SCRIPT_DIR/../san-compare.sh"
+
 echo -e "\n==================== TEST 1: EKU CONTRACTION (Lost mTLS clientAuth) ===================="
-/Users/kishorekumarmurugan/tools/Daily-tools/scripts/san-compare.sh "$DIR/c1_mtls.pem" "$DIR/c2_serveronly.pem" || true
+"$BIN" "$DIR/c1_mtls.pem" "$DIR/c2_serveronly.pem" || true
 
 echo -e "\n==================== TEST 2: FATAL EKU MISCONFIGURATION (Missing serverAuth) ===================="
-/Users/kishorekumarmurugan/tools/Daily-tools/scripts/san-compare.sh "$DIR/c1_mtls.pem" "$DIR/c3_nocertauth.pem" || true
+"$BIN" "$DIR/c1_mtls.pem" "$DIR/c3_nocertauth.pem" || true

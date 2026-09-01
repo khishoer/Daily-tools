@@ -26,11 +26,14 @@ openssl req -new -x509 -key "$DIR/key2.pem" -out "$DIR/expansion.pem" -days 90 -
 openssl req -new -x509 -key "$DIR/key2.pem" -out "$DIR/contraction.pem" -days 90 -subj "/CN=example.com" \
   -addext "subjectAltName=DNS:example.com,DNS:www.example.com"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$SCRIPT_DIR/../san-compare.sh"
+
 echo -e "\n==================== TEST 1: SEAMLESS RENEWAL ===================="
-/Users/kishorekumarmurugan/tools/Daily-tools/scripts/san-compare.sh "$DIR/base.pem" "$DIR/renewal.pem" || true
+"$BIN" "$DIR/base.pem" "$DIR/renewal.pem" || true
 
 echo -e "\n==================== TEST 2: SAN EXPANSION ===================="
-/Users/kishorekumarmurugan/tools/Daily-tools/scripts/san-compare.sh "$DIR/base.pem" "$DIR/expansion.pem" || true
+"$BIN" "$DIR/base.pem" "$DIR/expansion.pem" || true
 
 echo -e "\n==================== TEST 3: SAN CONTRACTION (BREAKING) ===================="
-/Users/kishorekumarmurugan/tools/Daily-tools/scripts/san-compare.sh "$DIR/base.pem" "$DIR/contraction.pem" || true
+"$BIN" "$DIR/base.pem" "$DIR/contraction.pem" || true
