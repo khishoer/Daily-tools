@@ -9,15 +9,18 @@ A curated collection of production-grade automation scripts, network diagnostics
 ```text
 Daily-tools/
 ├── tools/                      # Dedicated modular tool packages
-│   └── cert-compare/           # 🔐 Leaf certificate & SAN deep comparison utility
-│       ├── cert-compare.sh     # Executable script
+│   ├── cert-compare/           # 🔐 Leaf certificate & SAN deep comparison utility
+│   │   ├── cert-compare.sh     # Executable script
+│   │   ├── README.md           # Comprehensive manual & recipes
+│   │   └── tests/              # Test suite (scenarios, chronology, EKU)
+│   │
+│   └── ca-bundle-worker/       # 📦 CA bundle auditor, chain manager & trust store utility
+│       ├── ca-bundle-worker.sh # Executable script
 │       ├── README.md           # Comprehensive manual & recipes
-│       └── tests/              # Test suite (scenarios, chronology, EKU)
-│           ├── test_scenarios.sh
-│           ├── test_chronology.sh
-│           └── test_eku_scenarios.sh
+│       └── tests/              # Test suite (inspect, split, merge, order, diff)
 ├── cli/                        # CLI symlinks for quick global PATH execution
-│   └── cert-compare -> ../tools/cert-compare/cert-compare.sh
+│   ├── cert-compare -> ../tools/cert-compare/cert-compare.sh
+│   └── ca-bundle-worker -> ../tools/ca-bundle-worker/ca-bundle-worker.sh
 └── README.md
 ```
 
@@ -35,25 +38,22 @@ A terminal tool that deeply compares two X.509 leaf certificates across all stan
 * **Safety Guards**: Detects fatal `serverAuth` loss, mTLS `clientAuth` breakage, and cryptographic shifts (RSA ➔ ECDSA).
 * **Delta-Only Mode (`-d`)**: Suppresses identical rows to isolate changes on massive certificates.
 
-#### Quick Usage:
-```bash
-# Focus strictly on differences (suppresses all identical parameters and SANs)
-./tools/cert-compare/cert-compare.sh -d current_prod.crt new_candidate.crt
+👉 **[Read the Full `cert-compare` Manual & Recipes](tools/cert-compare/README.md)**
 
-# Compare live production website against a local renewal candidate
-./tools/cert-compare/cert-compare.sh https://example.com ./new_candidate.pem
+---
 
-# Compare two live hostnames
-./tools/cert-compare/cert-compare.sh google.com:443 youtube.com:443
+### 📦 2. CA Bundle Worker (`tools/ca-bundle-worker/`)
 
-# Compare SANs only
-./tools/cert-compare/cert-compare.sh --san-only prod.crt staging.crt
+A command-line tool for auditing, managing, and fixing multi-certificate CA bundles and TLS certificate chains.
 
-# Silent CI/CD mode (exit 0 if safe/identical, 1 if breaking differences)
-./tools/cert-compare/cert-compare.sh --quiet cert1.pem cert2.pem
-```
+* **`inspect`**: Audits every certificate in a bundle with expiry countdowns, duplicate detection, and weak hash alerts.
+* **`split`**: Extracts multi-cert bundles into clean individual `.pem` files named by Common Name.
+* **`merge`**: Merges files and directories into a single unified bundle with automatic SHA-256 deduplication.
+* **`order-chain`**: Re-orders messy certificate chains into the proper RFC hierarchy (`[Leaf] ➔ [Intermediate] ➔ [Root]`) required by NGINX, Envoy, Cloudflare, and Kubernetes TLS.
+* **`diff`**: Side-by-side comparison of two CA bundles to highlight added, removed, or expired CAs.
+* **`fetch`**: Downloads the complete served TLS intermediate chain directly from any live server.
 
-👉 **[Read the Full `cert-compare` Manual & CI/CD Recipes](tools/cert-compare/README.md)**
+👉 **[Read the Full `ca-bundle-worker` Manual & Recipes](tools/ca-bundle-worker/README.md)**
 
 ---
 
@@ -69,8 +69,9 @@ Add `cli/` to your PATH to run any tool directly by name:
 ```bash
 export PATH="$HOME/tools/Daily-tools/cli:$PATH"
 
-# Now run directly from any directory:
+# Now run any tool directly from anywhere:
 cert-compare google.com:443 youtube.com:443
+ca-bundle-worker inspect /etc/ssl/cert.pem
 ```
 
 ---
