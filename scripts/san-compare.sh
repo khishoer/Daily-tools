@@ -2,8 +2,7 @@
 # ==============================================================================
 # Script Name: san-compare.sh
 # Description: Compares two X.509 leaf certificates parameter-by-parameter and
-#              highlights differences with rich contextual verdict variations
-#              (Renewal, Expansion, Breaking Contraction, Crypto upgrades, CA shifts).
+#              displays a true SIDE-BY-SIDE SAN table with rich lifecycle verdicts.
 # Author: Daily Tools (https://github.com/khishoer/Daily-tools)
 # Requirements: bash, openssl, awk, sed, grep, python3
 # ==============================================================================
@@ -26,7 +25,6 @@ setup_colors() {
         BG_GREEN="\033[42;30m"
         BG_YELLOW="\033[43;30m"
         BG_BLUE="\033[44;37m"
-        BG_MAGENTA="\033[45;37m"
         RESET="\033[0m"
     else
         BOLD=""
@@ -42,7 +40,6 @@ setup_colors() {
         BG_GREEN=""
         BG_YELLOW=""
         BG_BLUE=""
-        BG_MAGENTA=""
         RESET=""
     fi
 }
@@ -57,15 +54,12 @@ ${BOLD}Usage:${RESET}
 
 ${BOLD}Description:${RESET}
   Deeply compares two X.509 leaf certificates across all standard parameters
-  (Subject, Issuer, Validity, Public Key, Key Usage, Fingerprints) and performs
-  a detailed Subject Alternative Name (SAN) delta analysis (Added / Removed / Common).
-  Outputs an intelligent, rich verdict categorized by lifecycle scenario:
+  with a dedicated ${BOLD}SIDE-BY-SIDE SAN COMPARISON TABLE${RESET} and rich lifecycle verdicts:
   - 🔄 Seamless Renewal / Re-issuance
   - 📈 Backwards-Compatible SAN Expansion
   - 🚨 Dangerous SAN Contraction (Breaking Changes)
   - 🔀 Mixed SAN Overhaul & Domain Drift
   - ❌ Completely Disjoint / Unrelated Certificates
-  - 🔐 Cryptographic & CA Migration Audits
 
 ${BOLD}Arguments:${RESET}
   <CERT1>, <CERT2>     Can be:
@@ -73,15 +67,15 @@ ${BOLD}Arguments:${RESET}
                        - Remote hostname with port (e.g. "google.com:443" or "https://github.com")
 
 ${BOLD}Options:${RESET}
-  -s, --san-only       Only compare Subject Alternative Names (SANs)
-  -q, --quiet          Quiet mode: suppress diff output, exit 0 if identical, 1 if differences
+  -s, --san-only       Only compare Subject Alternative Names (SANs) in side-by-side view
+  -w, --width <num>    Set terminal table width (default: auto or 100)
+  -q, --quiet          Quiet mode: suppress output, exit 0 if identical, 1 if differences
   -n, --no-color       Disable color output
   -h, --help           Show this help message
 
 ${BOLD}Examples:${RESET}
   san-compare.sh cert_v1.pem cert_v2.pem
-  san-compare.sh old_cert.crt https://example.com
-  san-compare.sh google.com:443 bing.com:443
+  san-compare.sh google.com:443 youtube.com:443
   san-compare.sh --san-only prod.crt staging.crt
 
 EOF
@@ -184,7 +178,7 @@ extract_params() {
     fi
 
     # Public Key Info (Algorithm & Size)
-    local pubkey_algo pubkey_bits pubkey_mod
+    local pubkey_algo pubkey_bits
     pubkey_algo=$(safe_x509_cmd "$pem" -noout -text | grep -A 1 "Public Key Algorithm:" | head -n 1 | awk -F: '{print $2}' | sed 's/^[ \t]*//' || true)
     pubkey_bits=$(safe_x509_cmd "$pem" -noout -text | grep -E "(Public-Key|RSA Public-Key|NIST CURVE|ASN1 OID):" | head -n 1 | sed -E 's/.*: (.*)/\1/' | sed 's/^[ \t]*//' || true)
     eval "${prefix}_pubkey_algo=\"\$pubkey_algo\""
@@ -253,6 +247,7 @@ compare_field() {
 # ------------------------------------------------------------------------------
 SAN_ONLY=false
 QUIET=false
+CUSTOM_WIDTH=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -263,6 +258,10 @@ while [[ $# -gt 0 ]]; do
         -s|--san-only)
             SAN_ONLY=true
             shift
+            ;;
+        -w|--width)
+            CUSTOM_WIDTH="$2"
+            shift 2
             ;;
         -q|--quiet)
             QUIET=true
@@ -375,12 +374,12 @@ fi
 # Banner & Targets
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}================================================================================${RESET}"
-echo -e "${BOLD}${CYAN}               🔐 X.509 CERTIFICATE & SAN COMPARISON REPORT                    ${RESET}"
-echo -e "${BOLD}${CYAN}================================================================================${RESET}"
+echo -e "${BOLD}${CYAN}========================================================================================================${RESET}"
+echo -e "${BOLD}${CYAN}                            🔐 X.509 CERTIFICATE & SAN COMPARISON REPORT                               ${RESET}"
+echo -e "${BOLD}${CYAN}========================================================================================================${RESET}"
 echo -e "  ${BOLD}Cert [1]:${RESET} ${YELLOW}${TARGET1}${RESET}"
 echo -e "  ${BOLD}Cert [2]:${RESET} ${YELLOW}${TARGET2}${RESET}"
-echo -e "${CYAN}--------------------------------------------------------------------------------${RESET}"
+echo -e "${CYAN}--------------------------------------------------------------------------------------------------------${RESET}"
 
 # ------------------------------------------------------------------------------
 # Parameter Diff Section (if not SAN-only)
@@ -407,58 +406,89 @@ if [[ "$SAN_ONLY" == false ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# SAN Analysis Section
+# SIDE-BY-SIDE SAN COMPARISON TABLE
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${MAGENTA}--- [ 2. Subject Alternative Name (SAN) Deep Analysis ] ---${RESET}"
-echo -e "  • Total SANs in Cert [1]: ${BOLD}${C1_SAN_COUNT}${RESET}"
-echo -e "  • Total SANs in Cert [2]: ${BOLD}${C2_SAN_COUNT}${RESET}"
-echo -e "  • Common Matches:         ${GREEN}${BOLD}${COMMON_COUNT}${RESET}"
-echo -e "  • Added in Cert [2]:      ${CYAN}${BOLD}${ADDED_COUNT}${RESET}"
-echo -e "  • Removed from Cert [1]:  ${RED}${BOLD}${REMOVED_COUNT}${RESET}"
-echo ""
+echo -e "\n${BOLD}${MAGENTA}--- [ 2. Subject Alternative Name (SAN) Side-by-Side Comparison ] ---${RESET}"
+echo -e "  • Total in Cert [1]: ${BOLD}${C1_SAN_COUNT}${RESET}  |  • Total in Cert [2]: ${BOLD}${C2_SAN_COUNT}${RESET}  |  • Common: ${GREEN}${BOLD}${COMMON_COUNT}${RESET}  |  • Added: ${CYAN}${BOLD}+${ADDED_COUNT}${RESET}  |  • Removed: ${RED}${BOLD}-${REMOVED_COUNT}${RESET}\n"
 
-if [[ $SAN_DIFF_COUNT -eq 0 ]]; then
-    echo -e "  ${GREEN}${BOLD}✔ SAN Status: EXACT MATCH (${C1_SAN_COUNT} entries identical)${RESET}"
-    if [[ "$C1_SAN_COUNT" -gt 0 ]]; then
-        echo -e "    ${DIM}Common SANs:${RESET}"
-        while IFS= read -r san; do
-            [[ -n "$san" ]] && echo -e "      ${GREEN}• $san${RESET}"
-        done < "$COMMON_SANS"
-    fi
-else
-    echo -e "  ${RED}${BOLD}✖ SAN Status: DIFFERENCES DETECTED (${SAN_DIFF_COUNT} delta entries)${RESET}\n"
+# Run Python side-by-side table renderer
+python3 -c "
+import os
+import sys
 
-    if [[ $ADDED_COUNT -gt 0 ]]; then
-        echo -e "  ${CYAN}${BOLD}➕ Added in Cert [2] (${ADDED_COUNT}):${RESET}"
-        while IFS= read -r san; do
-            [[ -n "$san" ]] && echo -e "      ${CYAN}+ $san${RESET}"
-        done < "$ADDED_SANS"
-        echo ""
-    fi
+c1_file = '''$C1_SAN_FILE'''
+c2_file = '''$C2_SAN_FILE'''
+target1 = '''$TARGET1'''
+target2 = '''$TARGET2'''
+use_color = os.environ.get('NO_COLOR') is None
 
-    if [[ $REMOVED_COUNT -gt 0 ]]; then
-        echo -e "  ${RED}${BOLD}➖ Removed from Cert [1] (${REMOVED_COUNT}):${RESET}"
-        while IFS= read -r san; do
-            [[ -n "$san" ]] && echo -e "      ${RED}- $san${RESET}"
-        done < "$REMOVED_SANS"
-        echo ""
-    fi
+with open(c1_file, 'r') as f:
+    c1_sans = [line.strip() for line in f if line.strip()]
 
-    if [[ $COMMON_COUNT -gt 0 ]]; then
-        echo -e "  ${GREEN}${BOLD}✔ Maintained / Common SANs (${COMMON_COUNT}):${RESET}"
-        while IFS= read -r san; do
-            [[ -n "$san" ]] && echo -e "      ${GREEN}• $san${RESET}"
-        done < "$COMMON_SANS"
-        echo ""
-    fi
-fi
+with open(c2_file, 'r') as f:
+    c2_sans = [line.strip() for line in f if line.strip()]
+
+c1_set = set(c1_sans)
+c2_set = set(c2_sans)
+all_sans = sorted(list(c1_set | c2_set))
+
+# Color helpers
+def colorize(text, color_code):
+    if not use_color:
+        return text
+    return f'\033[{color_code}m{text}\033[0m'
+
+# Column widths
+term_cols = 104
+col_w = 46
+
+header_c1 = f'Cert [1]: {target1}'[:col_w]
+header_c2 = f'Cert [2]: {target2}'[:col_w]
+
+border = '+' + '-' * (col_w + 2) + '+' + '-' * 8 + '+' + '-' * (col_w + 2) + '+'
+header = f'| {header_c1:<{col_w}} |  Diff  | {header_c2:<{col_w}} |'
+
+print(colorize(border, '36'))
+print(colorize(header, '1;37'))
+print(colorize(border, '36'))
+
+if not all_sans:
+    empty_row = f'| {\"<No SANs Found>\":<{col_w}} |  ==    | {\"<No SANs Found>\":<{col_w}} |'
+    print(empty_row)
+else:
+    for san in all_sans:
+        in_c1 = san in c1_set
+        in_c2 = san in c2_set
+        san_display = san[:col_w]
+
+        if in_c1 and in_c2:
+            diff_tag = colorize('  ==  ', '32;1')
+            left_txt = colorize(f'{san_display:<{col_w}}', '32')
+            right_txt = colorize(f'{san_display:<{col_w}}', '32')
+            print(f'| {left_txt} | {diff_tag} | {right_txt} |')
+        elif in_c1 and not in_c2:
+            diff_tag = colorize('  --  ', '31;1')
+            left_txt = colorize(f'{san_display:<{col_w}}', '31;1')
+            not_in_2 = '<Removed in Cert 2>'[:col_w]
+            right_txt = colorize(f'{not_in_2:<{col_w}}', '2;31')
+            print(f'| {left_txt} | {diff_tag} | {right_txt} |')
+        elif not in_c1 and in_c2:
+            diff_tag = colorize('  ++  ', '36;1')
+            not_in_1 = '<Not in Cert 1>'[:col_w]
+            left_txt = colorize(f'{not_in_1:<{col_w}}', '2;36')
+            right_txt = colorize(f'{san_display:<{col_w}}', '36;1')
+            print(f'| {left_txt} | {diff_tag} | {right_txt} |')
+
+print(colorize(border, '36'))
+"
 
 # ------------------------------------------------------------------------------
 # Multi-Dimensional Intelligence Verdict Analysis
 # ------------------------------------------------------------------------------
-echo -e "${CYAN}================================================================================${RESET}"
-echo -e "${BOLD}${CYAN}                 📊 COMPREHENSIVE VERDICT & RISK ANALYSIS                      ${RESET}"
-echo -e "${CYAN}================================================================================${RESET}"
+echo ""
+echo -e "${CYAN}========================================================================================================${RESET}"
+echo -e "${BOLD}${CYAN}                                📊 COMPREHENSIVE VERDICT & RISK ANALYSIS                                ${RESET}"
+echo -e "${CYAN}========================================================================================================${RESET}"
 
 # Determine Scenario Category
 SCENARIO=""
@@ -530,7 +560,7 @@ echo -e "  ${BOLD}${WHITE}🔍 Key Lifecycle Insights:${RESET}"
 
 # 1. SAN Insight
 if [[ "$SAN_DIFF_COUNT" -eq 0 ]]; then
-    echo -e "    • ${GREEN}SAN Continuity:${RESET}  100% match. All ${C1_SAN_COUNT} domain(s) fully preserved."
+    echo -e "    • ${GREEN}SAN Continuity:${RESET}  100% match. All ${C1_SAN_COUNT} domain(s) fully preserved in side-by-side alignment."
 elif [[ "$REMOVED_COUNT" -eq 0 ]]; then
     echo -e "    • ${GREEN}SAN Continuity:${RESET}  Backwards-compatible. All ${COMMON_COUNT} existing domains preserved + ${ADDED_COUNT} added."
 elif [[ "$COMMON_COUNT" -eq 0 ]]; then
@@ -592,10 +622,7 @@ case "$SCENARIO" in
         echo -e "    ${GREEN}✔ Safe for existing traffic.${RESET} Verify DNS A/CNAME records point to your load balancer for newly added SANs before routing new traffic."
         ;;
     "SAN_CONTRACTION")
-        echo -e "    ${RED}✖ DANGER OF OUTAGE!${RESET} The following domain(s) were removed in Cert [2]:"
-        while IFS= read -r san; do
-            [[ -n "$san" ]] && echo -e "        ${RED}• $san${RESET}"
-        done < "$REMOVED_SANS"
+        echo -e "    ${RED}✖ DANGER OF OUTAGE!${RESET} Domain(s) were removed in Cert [2] (see '--' entries in the table above)."
         echo -e "      ${RED}Do NOT deploy if production traffic is still actively hitting these removed hostnames!${RESET}"
         ;;
     "SAN_OVERHAUL")
@@ -606,7 +633,7 @@ case "$SCENARIO" in
         ;;
 esac
 
-echo -e "${CYAN}================================================================================${RESET}\n"
+echo -e "${CYAN}========================================================================================================${RESET}\n"
 
 if [[ "$SCENARIO" == "IDENTICAL" || "$SCENARIO" == "RENEWAL_SEAMLESS" || "$SCENARIO" == "EXPIRED_REPLACEMENT" || "$SCENARIO" == "SAN_EXPANSION" ]]; then
     exit 0
