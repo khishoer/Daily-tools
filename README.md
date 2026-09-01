@@ -50,6 +50,8 @@ A terminal tool that deeply compares two X.509 leaf certificates across all stan
 ./scripts/san-compare.sh --quiet cert1.pem cert2.pem
 ```
 
+👉 **[Read the Full User Manual & CI/CD Recipes (docs/san-compare-manual.md)](docs/san-compare-manual.md)**
+
 ---
 
 ## 🚀 Getting Started
