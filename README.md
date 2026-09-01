@@ -30,6 +30,10 @@ A terminal tool that deeply compares two X.509 leaf certificates across all stan
 
 #### Usage:
 ```bash
+# Focus strictly on differences (suppresses all identical parameters and SANs)
+./scripts/san-compare.sh --only-diff cert_v1.pem cert_v2.pem
+./scripts/san-compare.sh -d current_prod.crt new_candidate.crt
+
 # Compare two local certificate files
 ./scripts/san-compare.sh cert_v1.pem cert_v2.pem
 
@@ -42,7 +46,7 @@ A terminal tool that deeply compares two X.509 leaf certificates across all stan
 # Compare SANs only
 ./scripts/san-compare.sh --san-only prod.crt staging.crt
 
-# Quiet mode (exit 0 if identical, 1 if differences)
+# Quiet mode (exit 0 if identical/safe, 1 if breaking differences)
 ./scripts/san-compare.sh --quiet cert1.pem cert2.pem
 ```
 

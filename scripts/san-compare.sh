@@ -3,7 +3,8 @@
 # Script Name: san-compare.sh
 # Description: High-ergonomics X.509 certificate comparison & SAN diff tool.
 #              Automatically identifies Current/Hosted Baseline vs Renewal Candidate
-#              regardless of argument order, cleans SAN prefixes, and audits deployment risk.
+#              regardless of argument order, cleans SAN prefixes, supports --only-diff,
+#              and audits deployment risk.
 # Author: Daily Tools (https://github.com/khishoer/Daily-tools)
 # Requirements: bash, openssl, python3
 # ==============================================================================
@@ -28,6 +29,7 @@ Arguments:
                        - Remote hostname with port (e.g. "google.com:443" or "https://github.com")
 
 Options:
+  -d, --only-diff      Only show differing parameters and differing SAN entries (suppress identical rows)
   -s, --san-only       Only compare Subject Alternative Names (SANs)
   -q, --quiet          Quiet mode (exit 0 if safe/identical, 1 if breaking differences)
   -n, --no-color       Disable color output
@@ -35,10 +37,13 @@ Options:
   -h, --help           Show this help message
 
 Examples:
+  # Focus purely on differences
+  san-compare.sh --only-diff current.crt candidate.crt
+
   # Compare existing hosted cert against a new renewal candidate
   san-compare.sh current_prod.crt new_candidate.crt
   san-compare.sh new_candidate.crt https://example.com
-  san-compare.sh google.com:443 youtube.com:443
+  san-compare.sh --only-diff google.com:443 youtube.com:443
 
 EOF
 }
@@ -102,6 +107,7 @@ load_certificate() {
 # CLI Flag Parsing
 # ------------------------------------------------------------------------------
 SAN_ONLY=false
+ONLY_DIFF=false
 QUIET=false
 NO_COLOR_FLAG=0
 CUSTOM_WIDTH=108
@@ -111,6 +117,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             show_help
             exit 0
+            ;;
+        -d|--only-diff|--diff-only)
+            ONLY_DIFF=true
+            shift
             ;;
         -s|--san-only)
             SAN_ONLY=true
@@ -163,15 +173,16 @@ load_certificate "$TARGET2" "$CERT2_PEM"
 # ------------------------------------------------------------------------------
 # Execute Modern Ergonomic Comparison Engine (Python)
 # ------------------------------------------------------------------------------
-python3 - << 'EOF' "$CERT1_PEM" "$CERT2_PEM" "$TARGET1" "$TARGET2" "$SAN_ONLY" "$QUIET" "$NO_COLOR_FLAG" "$CUSTOM_WIDTH"
+python3 - << 'EOF' "$CERT1_PEM" "$CERT2_PEM" "$TARGET1" "$TARGET2" "$SAN_ONLY" "$ONLY_DIFF" "$QUIET" "$NO_COLOR_FLAG" "$CUSTOM_WIDTH"
 import sys
 import os
 import re
 import subprocess
 from datetime import datetime, timezone
 
-cert1_pem, cert2_pem, target1, target2, san_only_str, quiet_str, no_color_str, width_str = sys.argv[1:9]
+cert1_pem, cert2_pem, target1, target2, san_only_str, only_diff_str, quiet_str, no_color_str, width_str = sys.argv[1:10]
 san_only = san_only_str.lower() == 'true'
+only_diff = only_diff_str.lower() == 'true'
 quiet = quiet_str.lower() == 'true'
 no_color = (no_color_str == '1') or ('NO_COLOR' in os.environ)
 total_width = int(width_str) if width_str.isdigit() else 108
@@ -228,7 +239,6 @@ def run_cmd(cmd):
         return ""
 
 def clean_san(raw_san):
-    """Strips redundant DNS: prefix while preserving IP:, URI:, Email: markers."""
     s = raw_san.strip()
     if s.startswith("DNS:"):
         return s[4:].strip()
@@ -258,13 +268,11 @@ def parse_cert(pem_path):
     sig_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -text | grep 'Signature Algorithm:' | head -n 1")
     d['sig_algo'] = sig_raw.split(":")[-1].strip() if ":" in sig_raw else "N/A"
     
-    # Dates
     nb_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -startdate").replace("notBefore=", "").strip()
     na_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -enddate").replace("notAfter=", "").strip()
     d['not_before'] = nb_raw
     d['not_after'] = na_raw
     
-    # Date parsing
     d['dt_not_before'] = None
     d['dt_not_after'] = None
     try:
@@ -286,7 +294,6 @@ def parse_cert(pem_path):
         d['days_remaining'] = 0
         d['is_expired'] = False
 
-    # Public Key info
     txt = run_cmd(f"openssl x509 -in '{pem_path}' -noout -text")
     pk_algo = ""
     pk_size = ""
@@ -317,7 +324,6 @@ def parse_cert(pem_path):
     d['basic_constraints'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext basicConstraints | grep -v 'Basic Constraints'").strip()
     d['ocsp'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ocsp_uri")
     
-    # Cleaned SANs (no DNS: prefix)
     san_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext subjectAltName | grep -v 'Subject Alternative Name'")
     sans = []
     if san_raw:
@@ -334,8 +340,6 @@ c2 = parse_cert(cert2_pem)
 # ------------------------------------------------------------------------------
 # Chronology & Role Auto-Detection (Baseline vs Renewal Candidate)
 # ------------------------------------------------------------------------------
-# Determine which cert is older/baseline and which is newer/candidate
-# Criteria order: Expiration Date (dt_not_after) -> Issue Date (dt_not_before) -> Serial
 is_identical = (c1['sha256'] == c2['sha256'])
 
 c1_is_candidate = False
@@ -344,50 +348,44 @@ c2_is_candidate = False
 if is_identical:
     c1_role_label = "[ PEER TWIN ]"
     c2_role_label = "[ PEER TWIN ]"
-    candidate_id = "EQUAL"
+    candidate_num = 2
+    base_cert, cand_cert = c1, c2
+    base_target, cand_target = target1, target2
 else:
-    # Check expiry first
     if c1['dt_not_after'] and c2['dt_not_after']:
         if c2['dt_not_after'] > c1['dt_not_after']:
             c2_is_candidate = True
         elif c1['dt_not_after'] > c2['dt_not_after']:
             c1_is_candidate = True
         else:
-            # Same expiry date, check issue date (notBefore)
             if c1['dt_not_before'] and c2['dt_not_before']:
                 if c2['dt_not_before'] > c1['dt_not_before']:
                     c2_is_candidate = True
                 elif c1['dt_not_before'] > c2['dt_not_before']:
                     c1_is_candidate = True
     
-    # Fallback to Cert [2] as candidate if completely indeterminate
     if not c1_is_candidate and not c2_is_candidate:
         c2_is_candidate = True
 
     if c2_is_candidate:
         c1_role_label = "[ BASELINE / HOSTED ]"
         c2_role_label = "[ RENEWAL CANDIDATE ]"
-        base_cert = c1
-        cand_cert = c2
-        base_target = target1
-        cand_target = target2
+        base_cert, cand_cert = c1, c2
+        base_target, cand_target = target1, target2
         candidate_num = 2
     else:
         c1_role_label = "[ RENEWAL CANDIDATE ]"
         c2_role_label = "[ BASELINE / HOSTED ]"
-        base_cert = c2
-        cand_cert = c1
-        base_target = target2
-        cand_target = target1
+        base_cert, cand_cert = c2, c1
+        base_target, cand_target = target2, target1
         candidate_num = 1
 
-# SAN Set Calculation based on Baseline vs Candidate roles
 base_sans = set(base_cert['sans']) if not is_identical else set(c1['sans'])
 cand_sans = set(cand_cert['sans']) if not is_identical else set(c2['sans'])
 
 common_sans = sorted(list(base_sans & cand_sans))
-removed_sans = sorted(list(base_sans - cand_sans))  # In Baseline, Missing from Candidate (LOST)
-added_sans = sorted(list(cand_sans - base_sans))    # In Candidate, Not in Baseline (NEW)
+removed_sans = sorted(list(base_sans - cand_sans))
+added_sans = sorted(list(cand_sans - base_sans))
 all_unique_sans = sorted(list(set(c1['sans']) | set(c2['sans'])))
 
 common_count = len(common_sans)
@@ -425,13 +423,14 @@ if quiet:
 # ------------------------------------------------------------------------------
 print()
 banner_title = "🔐  X.509 CERTIFICATE COMPARISON & RENEWAL AUDITOR"
+if only_diff:
+    banner_title += " [ONLY DIFFERENCES]"
 inner_w = total_width - 4
 
 print(f"{C.CYAN}╭" + "─" * (total_width - 2) + f"╮{C.RESET}")
 print(f"{C.CYAN}│{C.RESET} {pad_to(f'{C.BOLD}{C.WHITE}{banner_title}{C.RESET}', inner_w, 'center')} {C.CYAN}│{C.RESET}")
 print(f"{C.CYAN}├" + "─" * (total_width - 2) + f"┤{C.RESET}")
 
-# Role badges
 if is_identical:
     t1_tag = f"{C.BG_GREEN} {c1_role_label} {C.RESET}"
     t2_tag = f"{C.BG_GREEN} {c2_role_label} {C.RESET}"
@@ -449,7 +448,6 @@ print(f"{C.CYAN}│{C.RESET} {pad_to(line_t1, inner_w)} {C.CYAN}│{C.RESET}")
 print(f"{C.CYAN}│{C.RESET} {pad_to(line_t2, inner_w)} {C.CYAN}│{C.RESET}")
 print(f"{C.CYAN}├" + "─" * (total_width - 2) + f"┤{C.RESET}")
 
-# Dashboard metrics framed around Baseline vs Renewal
 diff_badge = f"{C.RED}{C.BOLD}{param_diffs} Param Diff(s){C.RESET}" if param_diffs > 0 else f"{C.GREEN}{C.BOLD}All Params Match{C.RESET}"
 san_match_badge = f"{C.GREEN}{common_count} Common SANs{C.RESET}"
 san_add_badge = f"{C.CYAN}+{added_count} New in Candidate{C.RESET}" if added_count > 0 else f"{C.GRAY}0 New SANs{C.RESET}"
@@ -464,7 +462,7 @@ print(f"{C.CYAN}╰" + "─" * (total_width - 2) + f"╯{C.RESET}")
 # ------------------------------------------------------------------------------
 if not san_only:
     print()
-    sec1_title = "1. GENERAL PARAMETERS COMPARISON"
+    sec1_title = "1. GENERAL PARAMETERS (ONLY DIFFERENCES)" if only_diff else "1. GENERAL PARAMETERS COMPARISON"
     p_name_w = 22
     p_val_w = (total_width - p_name_w - 12) // 2
     
@@ -476,36 +474,44 @@ if not san_only:
     t_bot = f"╰" + "─" * (p_name_w + 2) + "┴" + "─" * (p_val_w + 2) + "┴" + "─" * 6 + "┴" + "─" * (p_val_w + 2) + "╯"
 
     print(f"{C.CYAN}{t_top}{C.RESET}")
-    print(f"{C.CYAN}{t_head}{C.RESET}")
-    print(f"{C.CYAN}{t_sep}{C.RESET}")
+    
+    filtered_params = [p for p in params_to_compare if (not only_diff or p[1] != p[2])]
 
-    for name, v1, v2 in params_to_compare:
-        v1_clean = v1 if v1 else "<None>"
-        v2_clean = v2 if v2 else "<None>"
-        
-        v1_disp = v1_clean if len(v1_clean) <= p_val_w else (v1_clean[:p_val_w-3] + "...")
-        v2_disp = v2_clean if len(v2_clean) <= p_val_w else (v2_clean[:p_val_w-3] + "...")
-        
-        if v1_clean == v2_clean:
-            tag = f"{C.GREEN} =  {C.RESET}"
-            v1_col = pad_to(f"{C.GRAY}{v1_disp}{C.RESET}", p_val_w)
-            v2_col = pad_to(f"{C.GRAY}{v2_disp}{C.RESET}", p_val_w)
-            p_col = pad_to(f"{C.WHITE}{name}{C.RESET}", p_name_w)
-        else:
-            tag = f"{C.RED}{C.BOLD} ≠  {C.RESET}"
-            v1_col = pad_to(f"{C.YELLOW if c1_is_candidate else C.WHITE}{v1_disp}{C.RESET}", p_val_w)
-            v2_col = pad_to(f"{C.YELLOW if c2_is_candidate else C.WHITE}{v2_disp}{C.RESET}", p_val_w)
-            p_col = pad_to(f"{C.CYAN}{C.BOLD}{name}{C.RESET}", p_name_w)
+    if only_diff and not filtered_params:
+        match_msg = f"{C.GREEN}✔ All {len(params_to_compare)} General Parameters are identical. No parameter differences detected.{C.RESET}"
+        print(f"{C.CYAN}│{C.RESET} {pad_to(match_msg, inner_w)} {C.CYAN}│{C.RESET}")
+        print(f"{C.CYAN}╰" + "─" * (total_width - 2) + f"╯{C.RESET}")
+    else:
+        print(f"{C.CYAN}{t_head}{C.RESET}")
+        print(f"{C.CYAN}{t_sep}{C.RESET}")
+
+        for name, v1, v2 in filtered_params:
+            v1_clean = v1 if v1 else "<None>"
+            v2_clean = v2 if v2 else "<None>"
             
-        print(f"{C.CYAN}│{C.RESET} {p_col} {C.CYAN}│{C.RESET} {v1_col} {C.CYAN}│{C.RESET} {tag} {C.CYAN}│{C.RESET} {v2_col} {C.CYAN}│{C.RESET}")
+            v1_disp = v1_clean if len(v1_clean) <= p_val_w else (v1_clean[:p_val_w-3] + "...")
+            v2_disp = v2_clean if len(v2_clean) <= p_val_w else (v2_clean[:p_val_w-3] + "...")
+            
+            if v1_clean == v2_clean:
+                tag = f"{C.GREEN} =  {C.RESET}"
+                v1_col = pad_to(f"{C.GRAY}{v1_disp}{C.RESET}", p_val_w)
+                v2_col = pad_to(f"{C.GRAY}{v2_disp}{C.RESET}", p_val_w)
+                p_col = pad_to(f"{C.WHITE}{name}{C.RESET}", p_name_w)
+            else:
+                tag = f"{C.RED}{C.BOLD} ≠  {C.RESET}"
+                v1_col = pad_to(f"{C.YELLOW if c1_is_candidate else C.WHITE}{v1_disp}{C.RESET}", p_val_w)
+                v2_col = pad_to(f"{C.YELLOW if c2_is_candidate else C.WHITE}{v2_disp}{C.RESET}", p_val_w)
+                p_col = pad_to(f"{C.CYAN}{C.BOLD}{name}{C.RESET}", p_name_w)
+                
+            print(f"{C.CYAN}│{C.RESET} {p_col} {C.CYAN}│{C.RESET} {v1_col} {C.CYAN}│{C.RESET} {tag} {C.CYAN}│{C.RESET} {v2_col} {C.CYAN}│{C.RESET}")
 
-    print(f"{C.CYAN}{t_bot}{C.RESET}")
+        print(f"{C.CYAN}{t_bot}{C.RESET}")
 
 # ------------------------------------------------------------------------------
 # 3. SIDE-BY-SIDE SUBJECT ALTERNATIVE NAMES (SAN) TABLE
 # ------------------------------------------------------------------------------
 print()
-sec2_title = "2. SUBJECT ALTERNATIVE NAMES (SAN) SIDE-BY-SIDE"
+sec2_title = "2. SUBJECT ALTERNATIVE NAMES (ONLY DIFFERENCES)" if only_diff else "2. SUBJECT ALTERNATIVE NAMES (SAN) SIDE-BY-SIDE"
 san_col_w = (total_width - 10) // 2
 
 s_top = f"╭─ {C.BOLD}{C.WHITE}{sec2_title}{C.RESET} " + "─" * max(0, total_width - len(sec2_title) - 5) + "╮"
@@ -516,17 +522,29 @@ s_sep = f"├" + "─" * (san_col_w + 2) + "┼" + "─" * 6 + "┼" + "─" * (
 s_bot = f"╰" + "─" * (san_col_w + 2) + "┴" + "─" * 6 + "┴" + "─" * (san_col_w + 2) + "╯"
 
 print(f"{C.CYAN}{s_top}{C.RESET}")
-print(f"{C.CYAN}{s_head}{C.RESET}")
-print(f"{C.CYAN}{s_sep}{C.RESET}")
 
 s1_set = set(c1['sans'])
 s2_set = set(c2['sans'])
 
-if not all_unique_sans:
-    no_san_msg = pad_to(f"{C.GRAY}<No Subject Alternative Names Found>{C.RESET}", san_col_w)
-    print(f"{C.CYAN}│{C.RESET} {no_san_msg} {C.CYAN}│{C.RESET} {C.GRAY} == {C.RESET} {C.CYAN}│{C.RESET} {no_san_msg} {C.CYAN}│{C.RESET}")
+if only_diff:
+    san_list_to_show = [s for s in all_unique_sans if not (s in s1_set and s in s2_set)]
 else:
-    for san in all_unique_sans:
+    san_list_to_show = all_unique_sans
+
+if only_diff and san_diff_count == 0:
+    no_diff_san = f"{C.GREEN}✔ All {common_count} SAN domains are identical between both certificates (0 delta entries).{C.RESET}"
+    print(f"{C.CYAN}│{C.RESET} {pad_to(no_diff_san, inner_w)} {C.CYAN}│{C.RESET}")
+    print(f"{C.CYAN}╰" + "─" * (total_width - 2) + f"╯{C.RESET}")
+elif not san_list_to_show:
+    no_san_msg = pad_to(f"{C.GRAY}<No Subject Alternative Names Found>{C.RESET}", san_col_w)
+    print(f"{C.CYAN}{s_head}{C.RESET}")
+    print(f"{C.CYAN}{s_sep}{C.RESET}")
+    print(f"{C.CYAN}│{C.RESET} {no_san_msg} {C.CYAN}│{C.RESET} {C.GRAY} == {C.RESET} {C.CYAN}│{C.RESET} {no_san_msg} {C.CYAN}│{C.RESET}")
+    print(f"{C.CYAN}{s_bot}{C.RESET}")
+else:
+    print(f"{C.CYAN}{s_head}{C.RESET}")
+    print(f"{C.CYAN}{s_sep}{C.RESET}")
+    for san in san_list_to_show:
         in_c1 = san in s1_set
         in_c2 = san in s2_set
         
@@ -538,7 +556,6 @@ else:
             left_side = pad_to(f"{C.GREEN}{san_disp}{C.RESET}", san_col_w)
             right_side = pad_to(f"{C.GREEN}{san_disp}{C.RESET}", san_col_w)
         elif in_c1 and not in_c2:
-            # Present in C1, absent in C2
             if c1_is_candidate:
                 tag = f"{C.CYAN}{C.BOLD} +  {C.RESET}"
                 left_side = pad_to(f"{C.CYAN}{C.BOLD}{san_disp}{C.RESET}", san_col_w)
@@ -548,7 +565,6 @@ else:
                 left_side = pad_to(f"{C.RED}{C.BOLD}{san_disp}{C.RESET}", san_col_w)
                 right_side = pad_to(f"{C.DARK_GRAY}{placeholder}{C.RESET}", san_col_w)
         elif not in_c1 and in_c2:
-            # Present in C2, absent in C1
             if c2_is_candidate:
                 tag = f"{C.CYAN}{C.BOLD} +  {C.RESET}"
                 left_side = pad_to(f"{C.DARK_GRAY}{placeholder}{C.RESET}", san_col_w)
@@ -560,7 +576,7 @@ else:
 
         print(f"{C.CYAN}│{C.RESET} {left_side} {C.CYAN}│{C.RESET} {tag} {C.CYAN}│{C.RESET} {right_side} {C.CYAN}│{C.RESET}")
 
-print(f"{C.CYAN}{s_bot}{C.RESET}")
+    print(f"{C.CYAN}{s_bot}{C.RESET}")
 
 # ------------------------------------------------------------------------------
 # 4. CANDIDATE READINESS & RISK VERDICT CARD
@@ -570,9 +586,6 @@ sec3_title = "3. RENEWAL READINESS & RISK VERDICT"
 v_top = f"╭─ {C.BOLD}{C.WHITE}{sec3_title}{C.RESET} " + "─" * max(0, total_width - len(sec3_title) - 5) + "╮"
 v_bot = f"╰" + "─" * (total_width - 2) + "╯"
 
-# ------------------------------------------------------------------------------
-# EKU & Key Usage Set Analysis
-# ------------------------------------------------------------------------------
 base_ekus = set(base_cert['eku_list']) if not is_identical else set(c1['eku_list'])
 cand_ekus = set(cand_cert['eku_list']) if not is_identical else set(c2['eku_list'])
 eku_removed = sorted(list(base_ekus - cand_ekus))
@@ -624,12 +637,10 @@ print(f"{C.CYAN}│{C.RESET} {pad_to(f' {C.BOLD}RISK LEVEL:{C.RESET}  {risk_pill
 print(f"{C.CYAN}│{C.RESET}" + " " * (inner_w + 2) + f"{C.CYAN}│{C.RESET}")
 print(f"{C.CYAN}│{C.RESET} {pad_to(f' {C.BOLD}{C.WHITE}🔍 Role-Aware Lifecycle Analysis (Baseline ➔ Candidate):{C.RESET}', inner_w)} {C.CYAN}│{C.RESET}")
 
-# 1. Detected Roles
 if not is_identical:
     role_info = f"   • {C.WHITE}Identified Roles:{C.RESET} Cert [{candidate_num}] ({cand_target}) is the {C.CYAN}{C.BOLD}Renewal Candidate{C.RESET}."
     print(f"{C.CYAN}│{C.RESET} {pad_to(role_info, inner_w)} {C.CYAN}│{C.RESET}")
 
-# 2. SAN Continuity
 if san_diff_count == 0:
     san_msg = f"   • {C.GREEN}SAN Coverage:{C.RESET}    100% Match ({common_count}/{common_count} hosted domains preserved)."
 elif removed_count == 0:
@@ -640,7 +651,6 @@ else:
     san_msg = f"   • {C.YELLOW}SAN Coverage:{C.RESET}    Partial ({common_count} kept, +{added_count} added, {C.RED}-{removed_count} lost from baseline{C.RESET})."
 print(f"{C.CYAN}│{C.RESET} {pad_to(san_msg, inner_w)} {C.CYAN}│{C.RESET}")
 
-# 3. Validity Delta
 if base_cert['dt_not_after'] and cand_cert['dt_not_after']:
     delta_days = (cand_cert['dt_not_after'] - base_cert['dt_not_after']).days
     if delta_days > 0:
@@ -651,7 +661,6 @@ if base_cert['dt_not_after'] and cand_cert['dt_not_after']:
         val_msg = f"   • {C.GRAY}Validity Delta:{C.RESET}  Both certificates share the exact same expiry date."
     print(f"{C.CYAN}│{C.RESET} {pad_to(val_msg, inner_w)} {C.CYAN}│{C.RESET}")
 
-# 4. Key Pair
 if base_cert['pubkey_hash'] == cand_cert['pubkey_hash'] and base_cert['pubkey_hash']:
     key_msg = f"   • {C.GRAY}Key Pair:{C.RESET}        Candidate re-uses existing private key (CSR re-signed)."
 else:
@@ -664,12 +673,10 @@ if eku_removed or eku_added:
     if eku_added:
         print(f"{C.CYAN}│{C.RESET} " + pad_to(f"   • {C.GREEN}EKU Added:{C.RESET}       Candidate gained: {', '.join(eku_added)}", inner_w) + f" {C.CYAN}│{C.RESET}")
 
-# 5. Crypto evolution
 if base_cert['pubkey_info'] != cand_cert['pubkey_info']:
     crypto_msg = f"   • {C.MAGENTA}Crypto Shift:{C.RESET}    {base_cert['pubkey_info']} ➔ {cand_cert['pubkey_info']}"
     print(f"{C.CYAN}│{C.RESET} {pad_to(crypto_msg, inner_w)} {C.CYAN}│{C.RESET}")
 
-# 6. CA Authority
 if base_cert['issuer_dn'] != cand_cert['issuer_dn']:
     ca_msg = f"   • {C.CYAN}CA Authority:{C.RESET}    {base_cert['issuer_cn']} ➔ {cand_cert['issuer_cn']}"
     print(f"{C.CYAN}│{C.RESET} {pad_to(ca_msg, inner_w)} {C.CYAN}│{C.RESET}")
