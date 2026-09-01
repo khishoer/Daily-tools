@@ -305,9 +305,15 @@ def parse_cert(pem_path):
     d['sha256'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -fingerprint -sha256").split("=")[-1].strip()
     d['sha1'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -fingerprint -sha1").split("=")[-1].strip()
     
-    # Extensions
-    d['key_usage'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext keyUsage | grep -v 'Key Usage'").strip()
-    d['ext_key_usage'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext extendedKeyUsage | grep -v 'Extended Key Usage'").strip()
+    # Extensions (Normalized Key Usage & EKU)
+    ku_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext keyUsage | grep -v 'Key Usage'").strip()
+    d['key_usage_list'] = sorted([x.strip() for x in ku_raw.split(",") if x.strip()])
+    d['key_usage'] = ", ".join(d['key_usage_list'])
+    
+    eku_raw = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext extendedKeyUsage | grep -v 'Extended Key Usage'").strip()
+    d['eku_list'] = sorted([x.strip() for x in eku_raw.split(",") if x.strip()])
+    d['ext_key_usage'] = ", ".join(d['eku_list'])
+    
     d['basic_constraints'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ext basicConstraints | grep -v 'Basic Constraints'").strip()
     d['ocsp'] = run_cmd(f"openssl x509 -in '{pem_path}' -noout -ocsp_uri")
     
@@ -564,19 +570,37 @@ sec3_title = "3. RENEWAL READINESS & RISK VERDICT"
 v_top = f"╭─ {C.BOLD}{C.WHITE}{sec3_title}{C.RESET} " + "─" * max(0, total_width - len(sec3_title) - 5) + "╮"
 v_bot = f"╰" + "─" * (total_width - 2) + "╯"
 
+# ------------------------------------------------------------------------------
+# EKU & Key Usage Set Analysis
+# ------------------------------------------------------------------------------
+base_ekus = set(base_cert['eku_list']) if not is_identical else set(c1['eku_list'])
+cand_ekus = set(cand_cert['eku_list']) if not is_identical else set(c2['eku_list'])
+eku_removed = sorted(list(base_ekus - cand_ekus))
+eku_added = sorted(list(cand_ekus - base_ekus))
+
+server_auth_lost = any("Server Authentication" in x for x in eku_removed)
+client_auth_lost = any("Client Authentication" in x for x in eku_removed)
+
 if is_identical:
     scenario_title = "🎯 EXACT IDENTICAL CERTIFICATE"
     risk_pill = f"{C.BG_GREEN} RISK: NONE (IDENTICAL ISSUE) {C.RESET}"
     action_item = f"{C.GREEN}✔ No action needed.{C.RESET} Both targets serve the exact same cryptographic certificate."
+elif server_auth_lost:
+    scenario_title = "🚨 FATAL EKU LOSS: Server Authentication Dropped!"
+    risk_pill = f"{C.BG_RED} RISK: CRITICAL (TLS HANDSHAKE OUTAGE) {C.RESET}"
+    action_item = f"{C.RED}✖ DO NOT DEPLOY!{C.RESET} The candidate is missing 'TLS Web Server Authentication'. Browsers & clients will reject connections!"
 elif common_count == 0 and len(base_sans) > 0 and len(cand_sans) > 0:
     scenario_title = "❌ COMPLETELY DISJOINT / UNRELATED CERTIFICATES"
     risk_pill = f"{C.BG_RED} RISK: HIGH (INCOMPATIBLE TARGETS) {C.RESET}"
     action_item = f"{C.RED}✖ Incompatible targets.{C.RESET} 0% domain overlap. Do not deploy as a replacement!"
 elif removed_count > 0:
-    # Any domain missing from candidate that is in baseline is dangerous
     scenario_title = f"🚨 SAN CONTRACTION / HOSTNAME REMOVAL ({removed_count} Domains Lost!)"
     risk_pill = f"{C.BG_RED} RISK: CRITICAL (BREAKING OUTAGE RISK) {C.RESET}"
     action_item = f"{C.RED}✖ DO NOT DEPLOY CANDIDATE!{C.RESET} The candidate is missing {removed_count} active domain(s) present in the hosted baseline!"
+elif client_auth_lost:
+    scenario_title = "⚠️ EKU CONTRACTION: Client Authentication (mTLS) Dropped"
+    risk_pill = f"{C.BG_YELLOW} RISK: HIGH (mTLS BREAKAGE RISK) {C.RESET}"
+    action_item = f"{C.YELLOW}⚠ Verify mTLS requirements.{C.RESET} 'TLS Web Client Authentication' was dropped; mutual TLS clients may fail."
 elif removed_count == 0 and added_count > 0:
     scenario_title = f"📈 SAFE SAN EXPANSION (+{added_count} New Domains Added)"
     risk_pill = f"{C.BG_BLUE} RISK: LOW-MEDIUM (SAFE FOR EXISTING TRAFFIC) {C.RESET}"
@@ -633,6 +657,12 @@ if base_cert['pubkey_hash'] == cand_cert['pubkey_hash'] and base_cert['pubkey_ha
 else:
     key_msg = f"   • {C.CYAN}Key Pair:{C.RESET}        Candidate uses a fresh private/public key pair (Rotated)."
 print(f"{C.CYAN}│{C.RESET} {pad_to(key_msg, inner_w)} {C.CYAN}│{C.RESET}")
+
+if eku_removed or eku_added:
+    if eku_removed:
+        print(f"{C.CYAN}│{C.RESET} " + pad_to(f"   • {C.RED}EKU Dropped:{C.RESET}     Candidate lost: {', '.join(eku_removed)}", inner_w) + f" {C.CYAN}│{C.RESET}")
+    if eku_added:
+        print(f"{C.CYAN}│{C.RESET} " + pad_to(f"   • {C.GREEN}EKU Added:{C.RESET}       Candidate gained: {', '.join(eku_added)}", inner_w) + f" {C.CYAN}│{C.RESET}")
 
 # 5. Crypto evolution
 if base_cert['pubkey_info'] != cand_cert['pubkey_info']:
