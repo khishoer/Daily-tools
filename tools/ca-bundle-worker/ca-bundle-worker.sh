@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Script Name: ca-bundle-worker.sh
-# Description: Production-grade mTLS CA Bundle Worker & Flapping Monitor.
+# Description: Unified Production-Grade mTLS CA Bundle Worker & Chain Manager.
 #              Audits mTLS bundles (duplicates, expired, non-CA leaves, weak crypto),
 #              safely appends/removes CAs, probes online FQDN acceptable client CAs,
-#              and continuously monitors for intermittent cloud drops & CA flapping.
+#              continuously monitors for cloud drops & CA flapping every 2s,
+#              reorders TLS chains hierarchically, diffs bundles, splits, and merges.
 # Author: Daily Tools (https://github.com/khishoer/Daily-tools)
 # Requirements: bash, openssl, python3
 # ==============================================================================
@@ -20,8 +21,9 @@ Usage:
 Description:
   mTLS CA Bundle Worker, Trust Store Maintenance, and Flapping Monitor.
   Audits client-auth CA bundles for issues, mutates CAs (append/remove), probes
-  server-advertised acceptable mTLS CAs, and monitors online endpoints every 2s
-  over a specified duration for intermittent cloud drops and CA drifting.
+  server-advertised acceptable mTLS CAs, monitors online endpoints every 2s
+  over a specified duration for intermittent cloud drops and CA drifting,
+  fixes unordered TLS chains, and compares trust stores side-by-side.
 
 Commands:
   audit         Deep health audit of mTLS bundle (duplicates, expired, non-CA leaves, weak crypto)
@@ -29,6 +31,10 @@ Commands:
   remove        Remove specific CAs by Common Name, SHA-256 fingerprint, or prune all expired CAs
   probe         Probe an online FQDN for server-advertised Acceptable Client CAs (mTLS CertificateRequest)
   monitor       Poll an online FQDN every 2s over N period to detect intermittent CA drops & backend flapping
+  order-chain   Re-order a certificate chain into valid RFC hierarchy (Leaf ➔ Intermediates ➔ Root)
+  diff          Compare two CA bundles side-by-side (added, removed, updated CAs)
+  fetch         Download the full served certificate chain from a remote TLS endpoint
+  find          Search for certificates by CN, Organization, or Fingerprint inside a bundle
   split         Extract every certificate in a bundle into individual clean .pem files
   merge         Consolidate multiple files/directories into one deduplicated CA bundle
 
@@ -42,21 +48,29 @@ Command Examples:
   ca-bundle-worker.sh audit mtls-ca-bundle.pem
 
   # 2. Safely append a new CA to the bundle
-  ca-bundle-worker.sh append mtls-ca-bundle.pem new-subca.crt
   ca-bundle-worker.sh append mtls-ca-bundle.pem new-subca.crt -o updated-bundle.pem
 
-  # 3. Remove a CA by Common Name or fingerprint
+  # 3. Remove a CA by Common Name, fingerprint, or prune all expired CAs
   ca-bundle-worker.sh remove mtls-ca-bundle.pem --cn "Old Enterprise Root CA"
-  ca-bundle-worker.sh remove mtls-ca-bundle.pem --fingerprint "A1:B2:C3:..."
   ca-bundle-worker.sh remove mtls-ca-bundle.pem --expired
 
   # 4. Probe an online FQDN for acceptable client certificate CAs
-  ca-bundle-worker.sh probe api.internal.corp:443
-  ca-bundle-worker.sh probe https://gateway.corp --bundle local-mtls-bundle.pem
+  ca-bundle-worker.sh probe api.internal.corp:443 --bundle local-mtls-bundle.pem
 
   # 5. Monitor an online FQDN every 2 seconds for 60s to detect intermittent CA drops & pod flapping
   ca-bundle-worker.sh monitor api.internal.corp:443 --interval 2 --duration 60
-  ca-bundle-worker.sh monitor https://mtls.corp --duration 30 --bundle mtls-ca-bundle.pem
+
+  # 6. Fix an unordered certificate chain for NGINX/Envoy/Kubernetes
+  ca-bundle-worker.sh order-chain unordered_chain.pem -o fullchain.pem
+
+  # 7. Compare two CA bundles side-by-side
+  ca-bundle-worker.sh diff truststore-v1.pem truststore-v2.pem
+
+  # 8. Fetch live chain from remote server
+  ca-bundle-worker.sh fetch google.com:443 -o google_chain.pem
+
+  # 9. Search inside a bundle
+  ca-bundle-worker.sh find ca-bundle.crt "DigiCert"
 
 EOF
 }
@@ -99,14 +113,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------------------------------------------------------
-# Python Execution Engine for mTLS CA Bundle Operations
+# Python Execution Engine for Unified CA Bundle Operations
 # ------------------------------------------------------------------------------
 python3 - << 'EOF' "$COMMAND" "$NO_COLOR_FLAG" "$CUSTOM_WIDTH" "${ARGS[@]}"
 import sys
 import os
 import re
 import time
-import socket
 import subprocess
 from datetime import datetime, timezone
 
@@ -249,14 +262,15 @@ def parse_single_cert(pem_str):
     d['is_ca'] = "CA:TRUE" in bc or "CA: TRUE" in bc
     d['is_self_signed'] = (d['subject_dn'] == d['issuer_dn'] and bool(d['subject_dn']))
     d['is_root'] = d['is_ca'] and d['is_self_signed']
-    d['is_leaf'] = not d['is_ca']  # Non-CA certificate!
+    d['is_leaf'] = not d['is_ca']
     
-    # Key Usage check
     ku_raw = run_cmd("openssl x509 -noout -ext keyUsage | grep -v 'Key Usage'", pem_str).strip()
     d['key_usage'] = ku_raw
     d['has_cert_sign'] = "Certificate Sign" in ku_raw or "keyCertSign" in ku_raw
     
     d['sha256'] = run_cmd("openssl x509 -noout -fingerprint -sha256", pem_str).split("=")[-1].strip()
+    d['ski'] = run_cmd("openssl x509 -noout -ext subjectKeyIdentifier | grep -v 'SubjectKeyIdentifier'", pem_str).strip()
+    d['aki'] = run_cmd("openssl x509 -noout -ext authorityKeyIdentifier | grep -A 1 'keyid:' | grep 'keyid:' | sed 's/.*keyid://'", pem_str).strip()
     return d
 
 def load_bundle_file(filepath):
@@ -272,13 +286,11 @@ def load_bundle_file(filepath):
         
     raw_certs = extract_certs_from_bundle(content)
     if not raw_certs:
-        # Check if PKCS7
         converted = run_cmd(f"openssl pkcs7 -in '{filepath}' -print_certs 2>/dev/null")
         if converted:
             raw_certs = extract_certs_from_bundle(converted)
             
     if not raw_certs:
-        # Try single cert
         single_pem = run_cmd(f"openssl x509 -in '{filepath}' -outform PEM 2>/dev/null")
         if single_pem:
             raw_certs = [single_pem]
@@ -290,7 +302,7 @@ def load_bundle_file(filepath):
     return [parse_single_cert(c) for c in raw_certs]
 
 # ------------------------------------------------------------------------------
-# 1. COMMAND: AUDIT (Deep health check for mTLS bundle)
+# 1. COMMAND: AUDIT / INSPECT
 # ------------------------------------------------------------------------------
 def cmd_audit():
     if not args:
@@ -308,19 +320,14 @@ def cmd_audit():
     expiring_soon = sum(1 for c in certs if c['expires_soon'])
     weak = sum(1 for c in certs if c['is_weak_sig'])
     
-    # Duplicate Analysis
     fps = [c['sha256'] for c in certs]
     dupe_fps = [fp for fp in set(fps) if fps.count(fp) > 1]
     duplicate_count = len(fps) - len(set(fps))
     
-    # Subject CN collisions (different certs with identical Subject CN)
     cns = [c['subject_cn'] for c in certs]
     cn_collisions = [cn for cn in set(cns) if cns.count(cn) > 1 and len(set(c['sha256'] for c in certs if c['subject_cn'] == cn)) > 1]
-
-    # Non-CA warning (Leaf certs in mTLS CA bundle is a severe bug)
     missing_sign = [c for c in certs if c['is_ca'] and not c['has_cert_sign'] and c['key_usage']]
 
-    # Health Score (0-100)
     penalties = (expired * 25) + (leaves * 30) + (duplicate_count * 15) + (weak * 20) + (len(missing_sign) * 10)
     health_score = max(0, 100 - penalties)
     
@@ -344,7 +351,6 @@ def cmd_audit():
     print(f"{C.CYAN}│{C.RESET} {pad_to(stat_line, inner_w)} {C.CYAN}│{C.RESET}")
     print(f"{C.CYAN}╰" + "─" * (total_width - 2) + f"╯{C.RESET}")
 
-    # Issues Card
     issues = []
     if expired > 0:
         issues.append((C.RED, f"🚨 {expired} EXPIRED CA(s) present in bundle. Clients using these CAs will fail mTLS!"))
@@ -364,7 +370,6 @@ def cmd_audit():
         for col, msg in issues:
             print(f"  {col}• {msg}{C.RESET}")
 
-    # Table of Certs
     print()
     sec_title = f"CERTIFICATE AUDIT TABLE ({total})"
     c_idx_w = 4
@@ -411,7 +416,7 @@ def cmd_audit():
     print(f"{C.CYAN}{t_bot}{C.RESET}\n")
 
 # ------------------------------------------------------------------------------
-# 2. COMMAND: APPEND (Safely add CA to bundle with verification)
+# 2. COMMAND: APPEND
 # ------------------------------------------------------------------------------
 def cmd_append():
     out_file = None
@@ -445,7 +450,6 @@ def cmd_append():
     out_file = out_file if out_file else target_bundle
     existing_certs = load_bundle_file(target_bundle)
     new_certs = load_bundle_file(new_ca_path)
-    
     existing_fps = set(c['sha256'] for c in existing_certs)
     
     print(f"\n{C.CYAN}[*] Validating candidate CA(s) from '{new_ca_path}' to append to '{target_bundle}'...{C.RESET}\n")
@@ -471,23 +475,18 @@ def cmd_append():
         print(f"\n{C.YELLOW}ℹ No new certificates were added to the bundle.{C.RESET}\n")
         return
 
-    # Write updated bundle
     with open(out_file, 'w') as f:
         f.write(f"# mTLS CA Bundle updated by ca-bundle-worker on {datetime.now(timezone.utc).isoformat()}\n\n")
         for c in existing_certs:
-            f.write(f"# Subject: {c['subject_dn']}\n")
-            f.write(f"# SHA256:  {c['sha256']}\n")
-            f.write(c['pem'] + "\n\n")
+            f.write(f"# Subject: {c['subject_dn']}\n# SHA256:  {c['sha256']}\n" + c['pem'] + "\n\n")
             
         for c in to_add:
-            f.write(f"# [NEWLY APPENDED] Subject: {c['subject_dn']}\n")
-            f.write(f"# SHA256:  {c['sha256']}\n")
-            f.write(c['pem'] + "\n\n")
+            f.write(f"# [NEWLY APPENDED] Subject: {c['subject_dn']}\n# SHA256:  {c['sha256']}\n" + c['pem'] + "\n\n")
             
     print(f"\n{C.GREEN}{C.BOLD}✔ Successfully appended {len(to_add)} CA(s). Bundle now contains {len(existing_certs) + len(to_add)} certificates ({out_file}).{C.RESET}\n")
 
 # ------------------------------------------------------------------------------
-# 3. COMMAND: REMOVE (Specifically prune a CA by CN, Fingerprint, or Expired)
+# 3. COMMAND: REMOVE
 # ------------------------------------------------------------------------------
 def cmd_remove():
     target_bundle = None
@@ -559,14 +558,12 @@ def cmd_remove():
     with open(out_file, 'w') as f:
         f.write(f"# mTLS CA Bundle pruned by ca-bundle-worker on {datetime.now(timezone.utc).isoformat()}\n\n")
         for c in kept:
-            f.write(f"# Subject: {c['subject_dn']}\n")
-            f.write(f"# SHA256:  {c['sha256']}\n")
-            f.write(c['pem'] + "\n\n")
+            f.write(f"# Subject: {c['subject_dn']}\n# SHA256:  {c['sha256']}\n" + c['pem'] + "\n\n")
             
     print(f"\n{C.GREEN}{C.BOLD}✔ Successfully removed {len(removed)} CA(s). Bundle now contains {len(kept)} certificates ({out_file}).{C.RESET}\n")
 
 # ------------------------------------------------------------------------------
-# 4. COMMAND: PROBE (Test online FQDN for acceptable client mTLS CAs)
+# 4. COMMAND: PROBE
 # ------------------------------------------------------------------------------
 def cmd_probe():
     target = None
@@ -605,10 +602,8 @@ def cmd_probe():
 
     print(f"{C.DIM}[*] Initiating TLS handshake with SNI '{host}'...{C.RESET}")
     
-    # Run OpenSSL handshake extraction
     raw_out = run_cmd(f"echo | openssl s_client -servername '{host}' -connect '{host}:{port}' -prexit 2>&1")
     
-    # Check if Acceptable client CA names is present
     ca_names = []
     if "Acceptable client certificate CA names" in raw_out:
         section = raw_out.split("Acceptable client certificate CA names")[-1]
@@ -619,7 +614,6 @@ def cmd_probe():
             elif "---" in line_str or "SSL handshake has read" in line_str or "New, TLSv" in line_str:
                 break
                 
-    # Also extract server certificate chain
     chain_raw = run_cmd(f"echo | openssl s_client -servername '{host}' -connect '{host}:{port}' -showcerts 2>/dev/null")
     server_certs = [parse_single_cert(c) for c in extract_certs_from_bundle(chain_raw)]
 
@@ -638,7 +632,6 @@ def cmd_probe():
             c_type = "Leaf" if idx == 1 else "Intermediate CA"
             print(f"  [{idx}] {C.BOLD}{c['subject_cn']}{C.RESET} ({c_type}) ➔ Issuer: {c['issuer_cn']} [Expires: {c['not_after']}]")
 
-    # If local bundle passed, cross reference
     if bundle_path:
         print(f"\n{C.BOLD}{C.WHITE}Cross-referencing with Local Bundle ('{bundle_path}')...{C.RESET}")
         local_certs = load_bundle_file(bundle_path)
@@ -657,12 +650,12 @@ def cmd_probe():
     print()
 
 # ------------------------------------------------------------------------------
-# 5. COMMAND: MONITOR (Check every 2s over N period for cloud drops & CA flapping)
+# 5. COMMAND: MONITOR
 # ------------------------------------------------------------------------------
 def cmd_monitor():
     target = None
     interval = 2.0
-    duration = 30.0  # seconds
+    duration = 30.0
     bundle_path = None
     
     i = 0
@@ -723,12 +716,10 @@ def cmd_monitor():
         t_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
         t0 = time.time()
         
-        # Connect & extract
         cmd = f"echo | openssl s_client -servername '{host}' -connect '{host}:{port}' -showcerts -prexit 2>&1"
         out = run_cmd(cmd, timeout=int(interval + 3))
         latency_ms = int((time.time() - t0) * 1000)
         
-        # Extract Acceptable CAs
         adv_cas = []
         if "Acceptable client certificate CA names" in out:
             sec = out.split("Acceptable client certificate CA names")[-1]
@@ -739,14 +730,12 @@ def cmd_monitor():
                 elif "---" in l or "SSL handshake has read" in l or "New, TLSv" in l:
                     break
                     
-        # Extract Server Leaf CN
         leaf_cn = "N/A"
         if "subject=" in out:
             leaf_m = re.search(r'subject=.*CN\s*=\s*([^,\n/]+)', out)
             if leaf_m:
                 leaf_cn = leaf_m.group(1).strip()
 
-        # Status determination
         if "Connection refused" in out or "connect:errno" in out or not out:
             status_badge = f"{C.BG_RED} FAILED {C.RESET}"
             adv_str = f"{C.RED}Connection Refused / Drop{C.RESET}"
@@ -785,9 +774,6 @@ def cmd_monitor():
         sleep_dur = max(0.1, interval - elapsed)
         time.sleep(sleep_dur)
 
-    # --------------------------------------------------------------------------
-    # Flapping / Stability Summary Card
-    # --------------------------------------------------------------------------
     print(f"{C.DIM}{'─'*total_width}{C.RESET}\n")
     
     flapping_detected = (len(unique_ca_fingerprints) > 1) or (len(unique_server_leaves) > 1)
@@ -803,11 +789,9 @@ def cmd_monitor():
         print(f"{C.CYAN}│{C.RESET}  {C.BOLD}Flapping / Drift:{C.RESET}     {C.BG_RED} FLAPPING / BACKEND DRIFT DETECTED! {C.RESET}")
         if len(unique_ca_fingerprints) > 1:
             print(f"{C.CYAN}│{C.RESET}  • {C.RED}mTLS CA Flapping:{C.RESET} {len(unique_ca_fingerprints)} distinct Acceptable CA sets were observed!")
-            print(f"{C.CYAN}│{C.RESET}    (Indicates load balancer is routing between drifting backend pods/gateways with different CA bundles).")
         if len(unique_server_leaves) > 1:
             print(f"{C.CYAN}│{C.RESET}  • {C.YELLOW}Server Leaf Flapping:{C.RESET} {len(unique_server_leaves)} different server certificates observed: {', '.join(unique_server_leaves)}")
 
-    # Latencies
     lats = [h['latency'] for h in history if h['ok']]
     if lats:
         avg_lat = sum(lats) // len(lats)
@@ -816,7 +800,210 @@ def cmd_monitor():
     print(f"{C.CYAN}╰" + "─" * (total_width - 2) + f"╯{C.RESET}\n")
 
 # ------------------------------------------------------------------------------
-# 6. COMMAND: SPLIT / MERGE ROUTING
+# 6. COMMAND: ORDER-CHAIN
+# ------------------------------------------------------------------------------
+def cmd_order_chain():
+    out_file = None
+    input_file = None
+    i = 0
+    while i < len(args):
+        if args[i] in ['-o', '--out', '--output']:
+            if i + 1 < len(args):
+                out_file = args[i+1]
+                i += 2
+                continue
+        elif not input_file:
+            input_file = args[i]
+            i += 1
+        else:
+            i += 1
+            
+    if not input_file:
+        print(f"{C.RED}[ERROR] Usage: ca-bundle-worker order-chain <chain.pem> [-o ordered.pem]{C.RESET}", file=sys.stderr)
+        sys.exit(1)
+        
+    certs = load_bundle_file(input_file)
+    if len(certs) <= 1:
+        print(f"{C.YELLOW}ℹ Only 1 certificate in file. No chain re-ordering needed.{C.RESET}")
+        return
+
+    print(f"\n{C.CYAN}[*] Analyzing and ordering certificate chain for '{input_file}'...{C.RESET}")
+    subj_map = {c['subject_dn']: c for c in certs}
+    leaf_candidates = [c for c in certs if not c['is_ca']]
+    if not leaf_candidates:
+        leaf_candidates = [c for c in certs if not c['is_root']]
+    leaf = leaf_candidates[0] if leaf_candidates else certs[0]
+
+    ordered = [leaf]
+    curr = leaf
+    visited = {leaf['sha256']}
+    
+    while True:
+        if curr['is_root']:
+            break
+        issuer_cert = subj_map.get(curr['issuer_dn'])
+        if not issuer_cert:
+            for c in certs:
+                if c['ski'] and curr['aki'] and c['ski'] == curr['aki']:
+                    issuer_cert = c
+                    break
+                    
+        if issuer_cert and issuer_cert['sha256'] not in visited:
+            ordered.append(issuer_cert)
+            visited.add(issuer_cert['sha256'])
+            curr = issuer_cert
+        else:
+            break
+            
+    for c in certs:
+        if c['sha256'] not in visited:
+            ordered.append(c)
+            visited.add(c['sha256'])
+
+    print(f"\n{C.BOLD}{C.WHITE}Hierarchical Certificate Chain Flow:{C.RESET}")
+    for idx, c in enumerate(ordered):
+        indent = "  " * idx
+        arrow = "└── " if idx > 0 else "    "
+        c_type = "[ ROOT CA ]" if c['is_root'] else ("[ INTERMEDIATE CA ]" if c['is_ca'] else "[ LEAF CERT ]")
+        print(f"  {indent}{C.CYAN}{arrow}{C.RESET}{C.BOLD}{c['subject_cn']}{C.RESET} {C.DIM}{c_type}{C.RESET}")
+
+    if out_file:
+        with open(out_file, 'w') as f:
+            for c in ordered:
+                f.write(c['pem'] + "\n")
+        print(f"\n{C.GREEN}{C.BOLD}✔ Successfully wrote properly ordered fullchain to '{out_file}'.{C.RESET}\n")
+
+# ------------------------------------------------------------------------------
+# 7. COMMAND: DIFF
+# ------------------------------------------------------------------------------
+def cmd_diff():
+    if len(args) < 2:
+        print(f"{C.RED}[ERROR] Usage: ca-bundle-worker diff <bundle1.pem> <bundle2.pem>{C.RESET}", file=sys.stderr)
+        sys.exit(1)
+        
+    b1_path = args[0]
+    b2_path = args[1]
+    
+    c1_list = load_bundle_file(b1_path)
+    c2_list = load_bundle_file(b2_path)
+    
+    c1_map = {c['sha256']: c for c in c1_list}
+    c2_map = {c['sha256']: c for c in c2_list}
+    
+    fps1 = set(c1_map.keys())
+    fps2 = set(c2_map.keys())
+    
+    common_fps = fps1 & fps2
+    removed_fps = fps1 - fps2
+    added_fps = fps2 - fps1
+
+    inner_w = total_width - 4
+
+    print()
+    print(f"{C.CYAN}╭" + "─" * (total_width - 2) + f"╮{C.RESET}")
+    print(f"{C.CYAN}│{C.RESET} {pad_to(f'{C.BOLD}{C.WHITE}📊 CA BUNDLE COMPARISON & TRUST STORE DIFF{C.RESET}', inner_w, 'center')} {C.CYAN}│{C.RESET}")
+    print(f"{C.CYAN}├" + "─" * (total_width - 2) + f"┤{C.RESET}")
+    print(f"{C.CYAN}│{C.RESET}  {C.BOLD}Bundle [1]:{C.RESET} {C.YELLOW}{b1_path:<{inner_w - 14}}{C.RESET} {C.CYAN}│{C.RESET}")
+    print(f"{C.CYAN}│{C.RESET}  {C.BOLD}Bundle [2]:{C.RESET} {C.YELLOW}{b2_path:<{inner_w - 14}}{C.RESET} {C.CYAN}│{C.RESET}")
+    print(f"{C.CYAN}├" + "─" * (total_width - 2) + f"┤{C.RESET}")
+
+    diff_summary = f"  • Common CAs: {C.GREEN}{len(common_fps)}{C.RESET}  │  • Added in [2]: {C.CYAN}+{len(added_fps)}{C.RESET}  │  • Removed from [1]: {C.RED}-{len(removed_fps)}{C.RESET}"
+    print(f"{C.CYAN}│{C.RESET} {pad_to(diff_summary, inner_w)} {C.CYAN}│{C.RESET}")
+    print(f"{C.CYAN}╰" + "─" * (total_width - 2) + f"╯{C.RESET}")
+
+    if added_fps:
+        print(f"\n{C.CYAN}{C.BOLD}➕ Certificates Added in Bundle [2] ({len(added_fps)}):{C.RESET}")
+        for fp in sorted(added_fps):
+            c = c2_map[fp]
+            print(f"  {C.CYAN}+{C.RESET} {C.BOLD}{c['subject_cn']}{C.RESET} (Issuer: {c['issuer_cn']}) [Expires: {c['not_after']}]")
+
+    if removed_fps:
+        print(f"\n{C.RED}{C.BOLD}➖ Certificates Removed from Bundle [1] ({len(removed_fps)}):{C.RESET}")
+        for fp in sorted(removed_fps):
+            c = c1_map[fp]
+            print(f"  {C.RED}-{C.RESET} {C.BOLD}{c['subject_cn']}{C.RESET} (Issuer: {c['issuer_cn']}) [Expires: {c['not_after']}]")
+
+    if not added_fps and not removed_fps:
+        print(f"\n{C.GREEN}{C.BOLD}✔ Both CA bundles contain the exact same {len(common_fps)} certificates (0 differences).{C.RESET}\n")
+    else:
+        print()
+
+# ------------------------------------------------------------------------------
+# 8. COMMAND: FETCH
+# ------------------------------------------------------------------------------
+def cmd_fetch():
+    out_file = None
+    target = None
+    i = 0
+    while i < len(args):
+        if args[i] in ['-o', '--out', '--output']:
+            if i + 1 < len(args):
+                out_file = args[i+1]
+                i += 2
+                continue
+        elif not target:
+            target = args[i]
+            i += 1
+        else:
+            i += 1
+            
+    if not target:
+        print(f"{C.RED}[ERROR] Usage: ca-bundle-worker fetch <host:port> [-o chain.pem]{C.RESET}", file=sys.stderr)
+        sys.exit(1)
+        
+    host = target.replace("https://", "").replace("http://", "").split("/")[0]
+    port = "443"
+    if ":" in host:
+        host, port = host.split(":", 1)
+        
+    print(f"\n{C.CYAN}[*] Connecting to {host}:{port} and retrieving served certificate chain...{C.RESET}")
+    raw_chain = run_cmd(f"echo | openssl s_client -servername '{host}' -connect '{host}:{port}' -showcerts 2>/dev/null")
+    certs = [parse_single_cert(c) for c in extract_certs_from_bundle(raw_chain)]
+    
+    if not certs:
+        print(f"{C.RED}[ERROR] Failed to fetch certificate chain from {host}:{port}{C.RESET}", file=sys.stderr)
+        sys.exit(1)
+        
+    print(f"\n{C.GREEN}{C.BOLD}✔ Retrieved {len(certs)} certificate(s) in served chain:{C.RESET}")
+    for idx, c in enumerate(certs, 1):
+        c_type = "Leaf" if idx == 1 else "Intermediate CA"
+        print(f"  [{idx}] {C.BOLD}{c['subject_cn']}{C.RESET} ({c_type}) ➔ Issuer: {c['issuer_cn']}")
+        
+    if out_file:
+        with open(out_file, 'w') as f:
+            for c in certs:
+                f.write(c['pem'] + "\n")
+        print(f"\n{C.GREEN}{C.BOLD}✔ Saved chain to '{out_file}'.{C.RESET}\n")
+
+# ------------------------------------------------------------------------------
+# 9. COMMAND: FIND
+# ------------------------------------------------------------------------------
+def cmd_find():
+    if len(args) < 2:
+        print(f"{C.RED}[ERROR] Usage: ca-bundle-worker find <bundle.pem> <query>{C.RESET}", file=sys.stderr)
+        sys.exit(1)
+        
+    bundle_path = args[0]
+    query = args[1].lower()
+    certs = load_bundle_file(bundle_path)
+    
+    matches = []
+    for c in certs:
+        if query in c['subject_dn'].lower() or query in c['issuer_dn'].lower() or query in c['sha256'].lower() or query in c['serial'].lower():
+            matches.append(c)
+            
+    print(f"\n{C.CYAN}[*] Searching for '{query}' in '{bundle_path}' ({len(certs)} total certs)...{C.RESET}")
+    print(f"{C.BOLD}Found {len(matches)} matching certificate(s):{C.RESET}\n")
+    
+    for idx, c in enumerate(matches, 1):
+        print(f"  {C.CYAN}[{idx}]{C.RESET} {C.BOLD}{c['subject_cn']}{C.RESET}")
+        print(f"      • Subject: {c['subject_dn']}")
+        print(f"      • Issuer:  {c['issuer_dn']}")
+        print(f"      • SHA-256: {c['sha256']}")
+        print(f"      • Status:  {c['days_remaining']} days remaining (Expires: {c['not_after']})\n")
+
+# ------------------------------------------------------------------------------
+# 10. COMMAND: SPLIT & MERGE
 # ------------------------------------------------------------------------------
 def cmd_split():
     if not args:
@@ -896,6 +1083,14 @@ elif command in ['probe', 'test-fqdn']:
     cmd_probe()
 elif command in ['monitor', 'watch']:
     cmd_monitor()
+elif command in ['order-chain', 'order']:
+    cmd_order_chain()
+elif command == 'diff':
+    cmd_diff()
+elif command == 'fetch':
+    cmd_fetch()
+elif command in ['find', 'search']:
+    cmd_find()
 elif command == 'split':
     cmd_split()
 elif command == 'merge':
