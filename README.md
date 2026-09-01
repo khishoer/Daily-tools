@@ -9,15 +9,15 @@ A curated collection of production-grade automation scripts, network diagnostics
 ```text
 Daily-tools/
 ├── tools/                      # Dedicated modular tool packages
-│   └── san-compare/            # 🔐 Leaf certificate & SAN deep comparison utility
-│       ├── san-compare.sh      # Executable script
+│   └── cert-compare/           # 🔐 Leaf certificate & SAN deep comparison utility
+│       ├── cert-compare.sh     # Executable script
 │       ├── README.md           # Comprehensive manual & recipes
 │       └── tests/              # Test suite (scenarios, chronology, EKU)
 │           ├── test_scenarios.sh
 │           ├── test_chronology.sh
 │           └── test_eku_scenarios.sh
 ├── cli/                        # CLI symlinks for quick global PATH execution
-│   └── san-compare -> ../tools/san-compare/san-compare.sh
+│   └── cert-compare -> ../tools/cert-compare/cert-compare.sh
 └── README.md
 ```
 
@@ -25,7 +25,7 @@ Daily-tools/
 
 ## 🛠️ Included Tools
 
-### 🔐 1. SAN & Certificate Compare (`tools/san-compare/`)
+### 🔐 1. Certificate & SAN Compare (`tools/cert-compare/`)
 
 A terminal tool that deeply compares two X.509 leaf certificates across all standard parameters, automatically identifies **Baseline vs Renewal Candidate** regardless of argument order, and calculates a side-by-side **Subject Alternative Name (SAN)** delta with critical EKU safety checks.
 
@@ -38,22 +38,22 @@ A terminal tool that deeply compares two X.509 leaf certificates across all stan
 #### Quick Usage:
 ```bash
 # Focus strictly on differences (suppresses all identical parameters and SANs)
-./tools/san-compare/san-compare.sh -d current_prod.crt new_candidate.crt
+./tools/cert-compare/cert-compare.sh -d current_prod.crt new_candidate.crt
 
 # Compare live production website against a local renewal candidate
-./tools/san-compare/san-compare.sh https://example.com ./new_candidate.pem
+./tools/cert-compare/cert-compare.sh https://example.com ./new_candidate.pem
 
 # Compare two live hostnames
-./tools/san-compare/san-compare.sh google.com:443 youtube.com:443
+./tools/cert-compare/cert-compare.sh google.com:443 youtube.com:443
 
 # Compare SANs only
-./tools/san-compare/san-compare.sh --san-only prod.crt staging.crt
+./tools/cert-compare/cert-compare.sh --san-only prod.crt staging.crt
 
 # Silent CI/CD mode (exit 0 if safe/identical, 1 if breaking differences)
-./tools/san-compare/san-compare.sh --quiet cert1.pem cert2.pem
+./tools/cert-compare/cert-compare.sh --quiet cert1.pem cert2.pem
 ```
 
-👉 **[Read the Full `san-compare` Manual & CI/CD Recipes](tools/san-compare/README.md)**
+👉 **[Read the Full `cert-compare` Manual & CI/CD Recipes](tools/cert-compare/README.md)**
 
 ---
 
@@ -70,7 +70,7 @@ Add `cli/` to your PATH to run any tool directly by name:
 export PATH="$HOME/tools/Daily-tools/cli:$PATH"
 
 # Now run directly from any directory:
-san-compare google.com:443 youtube.com:443
+cert-compare google.com:443 youtube.com:443
 ```
 
 ---

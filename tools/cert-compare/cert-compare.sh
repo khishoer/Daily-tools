@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script Name: san-compare.sh
+# Script Name: cert-compare.sh
 # Description: High-ergonomics X.509 certificate comparison & SAN diff tool.
 #              Automatically identifies Current/Hosted Baseline vs Renewal Candidate
 #              regardless of argument order, cleans SAN prefixes, supports --only-diff,
@@ -15,13 +15,12 @@
 show_help() {
     cat << EOF
 Usage:
-  san-compare.sh [OPTIONS] <CERT1> <CERT2>
+  cert-compare.sh [OPTIONS] <CERT1> <CERT2>
 
 Description:
-  High-ergonomics X.509 certificate and SAN comparison tool.
-  Intelligently detects which certificate is the CURRENT / HOSTED BASELINE
-  and which is the RENEWAL / TARGET CANDIDATE (regardless of argument order)
-  to ensure renewal validation is always accurate and intuitive.
+  High-ergonomics X.509 leaf certificate comparison and renewal auditor.
+  Compares all parameters (Subject, Issuer, Validity, Keys, EKU, Extensions)
+  with a side-by-side SAN delta table and intelligent risk verdicts.
 
 Arguments:
   <CERT1>, <CERT2>     Can be:
@@ -37,13 +36,13 @@ Options:
   -h, --help           Show this help message
 
 Examples:
-  # Focus purely on differences
-  san-compare.sh --only-diff current.crt candidate.crt
+  # Focus strictly on differences
+  cert-compare.sh --only-diff current.crt candidate.crt
 
   # Compare existing hosted cert against a new renewal candidate
-  san-compare.sh current_prod.crt new_candidate.crt
-  san-compare.sh new_candidate.crt https://example.com
-  san-compare.sh --only-diff google.com:443 youtube.com:443
+  cert-compare.sh current_prod.crt new_candidate.crt
+  cert-compare.sh new_candidate.crt https://example.com
+  cert-compare.sh --only-diff google.com:443 youtube.com:443
 
 EOF
 }

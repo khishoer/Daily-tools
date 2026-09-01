@@ -27,7 +27,7 @@ openssl req -new -x509 -key "$DIR/key2.pem" -out "$DIR/contraction.pem" -days 90
   -addext "subjectAltName=DNS:example.com,DNS:www.example.com"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SCRIPT_DIR/../san-compare.sh"
+BIN="$SCRIPT_DIR/../cert-compare.sh"
 
 echo -e "\n==================== TEST 1: SEAMLESS RENEWAL ===================="
 "$BIN" "$DIR/base.pem" "$DIR/renewal.pem" || true

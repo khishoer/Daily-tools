@@ -26,7 +26,7 @@ openssl req -new -x509 -key "$DIR/key2.pem" -out "$DIR/c3_nocertauth.pem" -days 
   -addext "extendedKeyUsage=codeSigning"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SCRIPT_DIR/../san-compare.sh"
+BIN="$SCRIPT_DIR/../cert-compare.sh"
 
 echo -e "\n==================== TEST 1: EKU CONTRACTION (Lost mTLS clientAuth) ===================="
 "$BIN" "$DIR/c1_mtls.pem" "$DIR/c2_serveronly.pem" || true

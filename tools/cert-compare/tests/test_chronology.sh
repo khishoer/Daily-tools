@@ -19,7 +19,7 @@ openssl req -new -x509 -key "$DIR/key2.pem" -out "$DIR/renewal_candidate.pem" -d
   -addext "subjectAltName=DNS:prod.example.com,DNS:api.example.com,DNS:www.example.com,DNS:dev.example.com"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SCRIPT_DIR/../san-compare.sh"
+BIN="$SCRIPT_DIR/../cert-compare.sh"
 
 echo -e "\n==================== TEST A: NORMAL ORDER (Baseline first, Candidate second) ===================="
 "$BIN" "$DIR/hosted_baseline.pem" "$DIR/renewal_candidate.pem" || true

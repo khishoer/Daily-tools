@@ -1,8 +1,8 @@
-# 🔐 SAN & Certificate Compare Utility (`san-compare`)
+# 🔐 Certificate & SAN Compare Utility (`cert-compare`)
 
 > **Automated X.509 Leaf Certificate Comparison, Side-by-Side SAN Diff, and Renewal Safety Auditor.**
 
-`san-compare` is an ergonomic command-line tool built for Network Engineers, DevOps, SREs, and Security Teams to validate TLS/SSL certificate renewals, prevent accidental outages from dropped Subject Alternative Names (SANs), verify Extended Key Usage (EKU) parameters, and audit cryptographic migrations before deploying to production.
+`cert-compare` is an ergonomic command-line tool built for Network Engineers, DevOps, SREs, and Security Teams to validate TLS/SSL certificate renewals, audit cryptographic parameters, prevent accidental outages from dropped Subject Alternative Names (SANs), verify Extended Key Usage (EKU) configurations, and ensure zero-downtime certificate rotation.
 
 ---
 
@@ -20,6 +20,7 @@
 
 ## ⚡ Key Features
 
+* **Comprehensive 15+ Parameter Matrix**: Deeply compares Subject DN/CN, Issuer DN/CN, Serial, Signature Algorithm, Public Key (algorithm, size, curve), Validity Dates, Validity Remaining Days, Key Usage, EKU, Basic Constraints, OCSP, SKI, and Fingerprints (SHA-256, SHA-1).
 * **Auto-Chronology Detection**: Intelligently identifies which certificate is the **Baseline/Hosted** and which is the **Renewal Candidate** based on validity timestamps, regardless of CLI argument order.
 * **Side-by-Side Visual SAN Table**: Alphabetically aligned 2-column grid highlighting additions (`+`), removals (`-`), and common domains (`==`).
 * **Noise-Free Domain Display**: Strips redundant `DNS:` prefixes while preserving clear badges for non-DNS identities (`[IP]`, `[URI]`, `[Email]`).
@@ -45,14 +46,14 @@
 ```bash
 git clone https://github.com/khishoer/Daily-tools.git
 cd Daily-tools
-chmod +x scripts/san-compare.sh
+chmod +x tools/cert-compare/cert-compare.sh
 ```
 
 #### Option B: Global Symlink (Run from any directory)
 ```bash
 # Add to user binary path
 mkdir -p ~/.local/bin
-ln -sf "$(pwd)/scripts/san-compare.sh" ~/.local/bin/san-compare
+ln -sf "$(pwd)/tools/cert-compare/cert-compare.sh" ~/.local/bin/cert-compare
 
 # Ensure ~/.local/bin is in your PATH (e.g. in ~/.zshrc or ~/.bashrc)
 export PATH="$HOME/.local/bin:$PATH"
@@ -63,7 +64,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ## 🛠️ Command Syntax & Options
 
 ```bash
-san-compare [OPTIONS] <CERT1> <CERT2>
+cert-compare [OPTIONS] <CERT1> <CERT2>
 ```
 
 ### Supported Target Formats
@@ -91,7 +92,7 @@ Verify a new renewal certificate before loading it onto an F5, Cloudflare, ALB, 
 
 ```bash
 # Compare live production website against new candidate certificate file
-san-compare https://app.example.com ./new_cert_2026.pem
+cert-compare https://app.example.com ./new_cert_2026.pem
 ```
 
 ---
@@ -100,9 +101,9 @@ san-compare https://app.example.com ./new_cert_2026.pem
 When comparing massive certificates (e.g., 50+ SANs), hide the unchanged domains to instantly spot what changed:
 
 ```bash
-san-compare --only-diff prod_baseline.crt renewal_candidate.crt
+cert-compare --only-diff prod_baseline.crt renewal_candidate.crt
 # or shorthand:
-san-compare -d prod_baseline.crt renewal_candidate.crt
+cert-compare -d prod_baseline.crt renewal_candidate.crt
 ```
 
 ---
@@ -111,8 +112,8 @@ san-compare -d prod_baseline.crt renewal_candidate.crt
 Quickly audit why two staging/production domains behave differently:
 
 ```bash
-san-compare google.com:443 youtube.com:443
-san-compare staging.example.com:443 prod.example.com:443
+cert-compare google.com:443 youtube.com:443
+cert-compare staging.example.com:443 prod.example.com:443
 ```
 
 ---
@@ -121,7 +122,7 @@ san-compare staging.example.com:443 prod.example.com:443
 Order doesn't matter; the tool detects the renewal candidate automatically:
 
 ```bash
-san-compare ./new_candidate.crt ./currently_hosted.crt
+cert-compare ./new_candidate.crt ./currently_hosted.crt
 ```
 
 ---
@@ -130,7 +131,7 @@ san-compare ./new_candidate.crt ./currently_hosted.crt
 Compare purely the domain coverage across two environments:
 
 ```bash
-san-compare --san-only us-east-gateway.crt eu-west-gateway.crt
+cert-compare --san-only us-east-gateway.crt eu-west-gateway.crt
 ```
 
 ---
@@ -179,7 +180,7 @@ Actionable assessment categorizing the scenario:
 
 ## 🤖 Automated CI/CD Pipeline Integration
 
-Integrate `san-compare` into your GitHub Actions, GitLab CI, or Jenkins deployment pipelines to block invalid certificate deployments automatically.
+Integrate `cert-compare` into your GitHub Actions, GitLab CI, or Jenkins deployment pipelines to block invalid certificate deployments automatically.
 
 ### Example: GitHub Actions Workflow
 ```yaml
@@ -200,7 +201,7 @@ jobs:
       - name: Validate Renewal Certificate
         run: |
           # Fails pipeline if candidate drops SANs, loses serverAuth, or has expired
-          ./scripts/san-compare.sh --quiet https://prod.example.com certs/new_candidate.pem
+          ./tools/cert-compare/cert-compare.sh --quiet https://prod.example.com certs/new_candidate.pem
 ```
 
 ---
@@ -210,11 +211,11 @@ jobs:
 #### Q: How does the script handle custom ports or IP addresses?
 You can pass any port or IP address directly:
 ```bash
-san-compare 192.168.1.100:8443 https://internal.corp:9443
+cert-compare 192.168.1.100:8443 https://internal.corp:9443
 ```
 
 #### Q: Does it verify the certificate chain (intermediates / root)?
-`san-compare` inspects the **leaf certificate** presented by the server during TLS SNI negotiation, which is the entity governing SANs, hostnames, and expiration.
+`cert-compare` inspects the **leaf certificate** presented by the server during TLS SNI negotiation, which is the entity governing SANs, hostnames, and expiration.
 
 #### Q: What if an endpoint uses SNI virtual hosting?
 The script automatically passes `-servername <host>` during OpenSSL TLS handshakes to ensure the correct virtual host leaf certificate is fetched.
