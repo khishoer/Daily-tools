@@ -14,10 +14,10 @@ Daily-tools/
 │   │   ├── README.md           # Comprehensive manual & recipes
 │   │   └── tests/              # Test suite (scenarios, chronology, EKU)
 │   │
-│   └── ca-bundle-worker/       # 📦 CA bundle auditor, chain manager & trust store utility
+│   └── ca-bundle-worker/       # 🛡️ mTLS CA trust store worker & flapping monitor
 │       ├── ca-bundle-worker.sh # Executable script
 │       ├── README.md           # Comprehensive manual & recipes
-│       └── tests/              # Test suite (inspect, split, merge, order, diff)
+│       └── tests/              # Test suite (audit, append, remove, probe, monitor)
 ├── cli/                        # CLI symlinks for quick global PATH execution
 │   ├── cert-compare -> ../tools/cert-compare/cert-compare.sh
 │   └── ca-bundle-worker -> ../tools/ca-bundle-worker/ca-bundle-worker.sh
@@ -42,16 +42,15 @@ A terminal tool that deeply compares two X.509 leaf certificates across all stan
 
 ---
 
-### 📦 2. CA Bundle Worker (`tools/ca-bundle-worker/`)
+### 🛡️ 2. mTLS CA Bundle Worker (`tools/ca-bundle-worker/`)
 
-A command-line tool for auditing, managing, and fixing multi-certificate CA bundles and TLS certificate chains.
+A command-line utility for auditing mTLS CA bundles, safely appending/removing CAs, probing server-advertised acceptable client CAs, and continuously monitoring live endpoints every 2 seconds for cloud drops and CA drifting.
 
-* **`inspect`**: Audits every certificate in a bundle with expiry countdowns, duplicate detection, and weak hash alerts.
-* **`split`**: Extracts multi-cert bundles into clean individual `.pem` files named by Common Name.
-* **`merge`**: Merges files and directories into a single unified bundle with automatic SHA-256 deduplication.
-* **`order-chain`**: Re-orders messy certificate chains into the proper RFC hierarchy (`[Leaf] ➔ [Intermediate] ➔ [Root]`) required by NGINX, Envoy, Cloudflare, and Kubernetes TLS.
-* **`diff`**: Side-by-side comparison of two CA bundles to highlight added, removed, or expired CAs.
-* **`fetch`**: Downloads the complete served TLS intermediate chain directly from any live server.
+* **`audit`**: Deep health check detecting expired CAs, duplicates, weak hashes, and non-CA leaf certificates accidentally bundled.
+* **`append`**: Safely adds a new CA to the bundle with pre-validation and duplicate suppression.
+* **`remove`**: Specifically prunes CAs by Common Name (`--cn`), SHA-256 fingerprint (`--fingerprint`), or prunes all expired CAs (`--expired`).
+* **`probe`**: Probes an online FQDN to extract server-advertised **`Acceptable client certificate CA names`** and cross-references against your local bundle.
+* **`monitor`**: Polls live endpoints **every 2 seconds over N duration** to catch intermittent network drops and backend pod CA drifting.
 
 👉 **[Read the Full `ca-bundle-worker` Manual & Recipes](tools/ca-bundle-worker/README.md)**
 
@@ -69,9 +68,10 @@ Add `cli/` to your PATH to run any tool directly by name:
 ```bash
 export PATH="$HOME/tools/Daily-tools/cli:$PATH"
 
-# Now run any tool directly from anywhere:
+# Run tools directly from any directory:
 cert-compare google.com:443 youtube.com:443
-ca-bundle-worker inspect /etc/ssl/cert.pem
+ca-bundle-worker audit /etc/ssl/client_cas.pem
+ca-bundle-worker monitor api.internal.corp:443 --interval 2 --duration 60
 ```
 
 ---
